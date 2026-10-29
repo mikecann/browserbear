@@ -1,0 +1,9 @@
+{
+  // paws.mikecann.app: the Paws homepage and the privacy policy the Chrome Web Store
+  // links to. Static files only. Deploy with ./deploy.sh.
+  "name": "paws-site",
+  "compatibility_date": "2026-10-29",
+  "assets": { "directory": "./public", "html_handling": "auto-trailing-slash" },
+  "routes": [{ "pattern": "paws.mikecann.app", "custom_domain": true }],
+  "workers_dev": false
+}
