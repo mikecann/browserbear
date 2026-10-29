@@ -1,0 +1,38 @@
+{
+  "manifest_version": 3,
+  "name": "Paws",
+  "version": "0.1.2",
+  "description": "Lets your local AI agents use this Chrome profile, through the Paws service on your Mac.",
+  "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAtUJ4gV0Woviu2XnpZZfVvDo9rCzaWCD0JNnkNdw/r8WKhl2abYBvzHmgfPG29ZsKK3ahgKz8/sWN6ibEvLpqWhez2dL48azThCbBlllDU+ygrMxhCS+Apd0yFPPkjLiNlLtaHByo/ebpDwX0tzNNDZMCUOpnHfr8szFlt22IxjSwrUvbgaISpkEURi7ZiMskF1xKwd3Iqk0X72loDKIVFt0ROMGWR3nEHk6ASv5wNSF1vaYW8Bc6+fDmSJMCrVTmcy6HyYwSqiJjbvIGu4AfMm8WrFoGfxhJ97UaTQmE77MmKHWbqbahxYeGIztHRPrYNqUGHIGSH0brgsCh5kD8wwIDAQAB",
+  "background": {
+    "service_worker": "background.js"
+  },
+  "permissions": [
+    "debugger",
+    "nativeMessaging",
+    "tabs",
+    "tabGroups",
+    "alarms",
+    "storage",
+    "downloads",
+    "identity",
+    "identity.email"
+  ],
+  "host_permissions": [
+    "<all_urls>"
+  ],
+  "minimum_chrome_version": "125",
+  "icons": {
+    "16": "icons/icon-16.png",
+    "32": "icons/icon-32.png",
+    "48": "icons/icon-48.png",
+    "128": "icons/icon-128.png"
+  },
+  "action": {
+    "default_icon": {
+      "16": "icons/icon-16.png",
+      "32": "icons/icon-32.png"
+    },
+    "default_title": "Paws"
+  }
+}
