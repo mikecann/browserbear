@@ -39,8 +39,11 @@ paws CLI (or Threadbear)
 ./scripts/install.sh     # native host for every profile, and `paws` on your PATH
 ```
 
-Then in each Chrome profile you want agents to use: `chrome://extensions`, turn on
-Developer mode, Load unpacked, pick this repo's `extension` folder. For uploads, open
+Then add the extension to each Chrome profile you want agents to use. Once the
+Chrome Web Store listing is live (it's in review), `./scripts/install.sh --store` makes
+Chrome offer it in every profile, and each one asks you once. Until then:
+`chrome://extensions`, turn on Developer mode, Load unpacked, pick this repo's `extension`
+folder. For uploads, open
 the extension's Details and turn on "Allow access to file URLs". The extension's id is
 fixed (`iljcldkflmlnmfhbllafbbfnchhoccok`) by the key in its manifest.
 

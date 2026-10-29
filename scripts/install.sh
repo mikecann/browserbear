@@ -7,8 +7,11 @@ root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 home="$HOME/Library/Application Support/Paws"
 hosts="$HOME/Library/Application Support/Google/Chrome/NativeMessagingHosts"
 node=$(command -v node)
-# The id comes from the "key" in the manifest, so it's the same everywhere.
-ext_id=iljcldkflmlnmfhbllafbbfnchhoccok
+# Two ids may talk to the host: the Chrome Web Store build, and an unpacked
+# checkout (its id comes from the "key" in the manifest, so it's the same
+# everywhere).
+store_id=cdoogjjahnadjnjpikbmcidkilpdcbnn
+dev_id=iljcldkflmlnmfhbllafbbfnchhoccok
 
 mkdir -p "$home" "$hosts" "$HOME/.local/bin"
 chmod 700 "$home"
@@ -26,11 +29,20 @@ cat > "$hosts/dev.paws.host.json" <<EOF
   "description": "Paws: lets local AI agents use this Chrome profile",
   "path": "$home/paws-host",
   "type": "stdio",
-  "allowed_origins": ["chrome-extension://$ext_id/"]
+  "allowed_origins": ["chrome-extension://$store_id/", "chrome-extension://$dev_id/"]
 }
 EOF
+
+# --store: have Chrome offer the Web Store build in every profile, new ones too
+# (each asks once, "keep it?"). The same mechanism Google Drive's launcher uses.
+if [ "${1:-}" = "--store" ]; then
+  ext="$HOME/Library/Application Support/Google/Chrome/External Extensions"
+  mkdir -p "$ext"
+  printf '{"external_update_url": "https://clients2.google.com/service/update2/crx"}\n' > "$ext/$store_id.json"
+  echo "Chrome will offer Paws in every profile next time it starts."
+fi
 
 ln -sf "$root/cli.mjs" "$HOME/.local/bin/paws"
 chmod 755 "$root/cli.mjs"
 echo "Installed. Native host: $hosts/dev.paws.host.json"
-echo "Now load $root/extension unpacked in each Chrome profile (chrome://extensions, Developer mode, Load unpacked)."
+[ "${1:-}" = "--store" ] || echo "Add the extension to each profile: rerun with --store once the Web Store listing is live, or load $root/extension unpacked (chrome://extensions, Developer mode, Load unpacked)."
