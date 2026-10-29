@@ -23,6 +23,7 @@ test('CLI -> service -> host -> fake extension and back', async (t) => {
 
   const host = spawn(process.execPath, [path.join(root, 'host', 'paws-host.mjs'), 'chrome-extension://x/'], { env });
   const cdpCalls = [];
+  let topNode = 99; // what DOM.getNodeForLocation says is at the click point
   const reply = (msg) => host.stdin.write(encodeNative(msg));
   host.stdout.on(
     'data',
@@ -39,6 +40,10 @@ test('CLI -> service -> host -> fake extension and back', async (t) => {
             ],
           },
           'DOM.getContentQuads': { quads: [[0, 0, 10, 0, 10, 10, 0, 10]] },
+          'DOM.getNodeForLocation': { backendNodeId: topNode },
+          'DOM.resolveNode': { object: { objectId: `obj-${args.params?.backendNodeId}` } },
+          // Only asked when something else is on top: it names the covering element.
+          'Runtime.callFunctionOn': { result: { value: 'div#overlay' } },
         };
         return reply({ id, ok: true, result: results[args.method] || {} });
       }
@@ -75,6 +80,12 @@ test('CLI -> service -> host -> fake extension and back', async (t) => {
     cdpCalls.filter((m) => m.startsWith('Input.')),
     ['Input.dispatchMouseEvent', 'Input.dispatchMouseEvent'],
   );
+
+  // Something covering the button: no real click, a script click instead.
+  topNode = 55;
+  cdpCalls.length = 0;
+  assert.match(await paws('click', '7', 'e1'), /div#overlay was on top of it, so that was a script click/);
+  assert.equal(cdpCalls.filter((m) => m.startsWith('Input.')).length, 0);
 
   await assert.rejects(paws('click', '7', 'e42'), /unknown ref e42/);
   await assert.rejects(paws('tabs', '--profile', 'Personal'), /no connected profile matches "Personal"/);

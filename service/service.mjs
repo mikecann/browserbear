@@ -86,9 +86,44 @@ const state = (tabId) => {
   return tabState.get(tabId);
 };
 
-async function cdp(tabId, method, params) {
-  return call(await ownerOf(tabId), 'cdp', { tabId, method, params }, 20_000);
+async function cdp(tabId, method, params, timeoutMs = 20_000) {
+  return call(await ownerOf(tabId), 'cdp', { tabId, method, params }, timeoutMs);
 }
+
+// Is the element at (x, y) the one we mean, or something inside it? A dialog
+// still animating in, a toast or a transparent overlay can sit on top, and a
+// real click then lands on that instead (Sentry's Remove Project dialog, 29 Oct).
+async function hitsTarget(tabId, backendNodeId, at) {
+  const hit = await cdp(tabId, 'DOM.getNodeForLocation', { x: Math.round(at.x), y: Math.round(at.y), ignorePointerEventsNone: true }).catch(() => null);
+  if (!hit?.backendNodeId) return { ok: false, what: 'nothing' };
+  if (hit.backendNodeId === backendNodeId) return { ok: true };
+  const [{ object: target }, { object: top }] = await Promise.all([
+    cdp(tabId, 'DOM.resolveNode', { backendNodeId }),
+    cdp(tabId, 'DOM.resolveNode', { backendNodeId: hit.backendNodeId }),
+  ]);
+  const { result } = await cdp(tabId, 'Runtime.callFunctionOn', {
+    objectId: target.objectId,
+    arguments: [{ objectId: top.objectId }],
+    functionDeclaration: `function (top) {
+      const el = top.nodeType === 1 ? top : top.parentElement;
+      if (this === el || this.contains(el)) return '';
+      return (el.getAttribute('aria-label') || el.tagName.toLowerCase()) + (el.id ? '#' + el.id : '');
+    }`,
+    returnByValue: true,
+  });
+  return result.value ? { ok: false, what: result.value } : { ok: true };
+}
+
+async function scriptClick(tabId, backendNodeId) {
+  const { object } = await cdp(tabId, 'DOM.resolveNode', { backendNodeId });
+  await cdp(tabId, 'Runtime.callFunctionOn', { objectId: object.objectId, functionDeclaration: SCRIPT_CLICK });
+}
+
+// Chrome only answers an input event once the page has handled it, and a busy
+// page (App Store Connect, 29 Oct) can take longer than any sane timeout even
+// though the click landed. So input gets a shorter wait, and running out of
+// it means "probably done, look before retrying", not an error.
+const INPUT_WAIT_MS = 8_000;
 
 async function nodeFor(tabId, ref) {
   const backendNodeId = state(tabId).refs.node(ref);
@@ -126,22 +161,35 @@ async function center(tabId, backendNodeId) {
 // event on a background tab, 29 Oct), so: Paws's own tabs are brought to the
 // front of Paws's window; your tabs are never pulled forward behind your back,
 // and get a script click instead, which most sites accept.
-async function clickNode(tabId, backendNodeId) {
+async function clickNode(tabId, backendNodeId, { script = false } = {}) {
   const p = await ownerOf(tabId);
   let tab = (await call(p, 'tabs')).find((t) => t.tabId === tabId);
   if (!tab?.active && pawsTabs.has(tabId)) tab = await call(p, 'show', { tabId });
+  if (script) {
+    await scriptClick(tabId, backendNodeId);
+    return '(script click, as asked)';
+  }
   const at = tab?.active ? await center(tabId, backendNodeId) : null;
   if (!at) {
-    const { object } = await cdp(tabId, 'DOM.resolveNode', { backendNodeId });
-    await cdp(tabId, 'Runtime.callFunctionOn', { objectId: object.objectId, functionDeclaration: SCRIPT_CLICK });
+    await scriptClick(tabId, backendNodeId);
     return tab?.active ? '' : `(tab ${tabId} is in the background, so that was a script click; paws show ${tabId} brings it forward for a real one)`;
+  }
+  const hit = await hitsTarget(tabId, backendNodeId, at);
+  if (!hit.ok) {
+    await scriptClick(tabId, backendNodeId);
+    return `(${hit.what} was on top of it, so that was a script click)`;
   }
   const base = { x: at.x, y: at.y, button: 'left', clickCount: 1 };
   // No separate mouseMoved first: each input event waits for the page to draw
   // a frame (1.5-3 s apiece on a busy Mac, 29 Oct), and pressed at x,y
   // already moves the pointer there.
-  await cdp(tabId, 'Input.dispatchMouseEvent', { ...base, type: 'mousePressed' });
-  await cdp(tabId, 'Input.dispatchMouseEvent', { ...base, type: 'mouseReleased' });
+  try {
+    await cdp(tabId, 'Input.dispatchMouseEvent', { ...base, type: 'mousePressed' }, INPUT_WAIT_MS);
+    await cdp(tabId, 'Input.dispatchMouseEvent', { ...base, type: 'mouseReleased' }, INPUT_WAIT_MS);
+  } catch (e) {
+    if (!/timed out/.test(e.message)) throw e;
+    return `(the page hadn't confirmed the click after ${INPUT_WAIT_MS / 1000} s, so it's busy; the click has probably landed, check below before retrying)`;
+  }
   return '';
 }
 
@@ -265,10 +313,13 @@ const commands = {
 
   snap: ({ tab, full }) => snapshot(tab, { full }),
 
-  async click({ tab, ref }) {
-    const note = await clickNode(tab, await nodeFor(tab, ref));
+  async click({ tab, ref, script }) {
+    const note = await clickNode(tab, await nodeFor(tab, ref), { script });
     await settle();
-    return (note ? note + '\n' : '') + (await snapshot(tab));
+    let out = await snapshot(tab);
+    // A click that changed nothing visible is often one the page ignored.
+    if (out.endsWith('(no change)') && !script) out += `\n(if that click should have done something: paws click ${tab} ${ref} --script)`;
+    return (note ? note + '\n' : '') + out;
   },
 
   async type({ tab, ref, text, submit, replace }) {

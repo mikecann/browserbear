@@ -15,7 +15,7 @@ const USAGE = `paws: let agents use your real Chrome profiles
   paws open <url> --profile p [--group name]
   paws claim <text> [--profile p]        find one of your open tabs by URL or title
   paws snap <tab> [--full]               what's on the page (a diff after the first look)
-  paws click <tab> <ref>
+  paws click <tab> <ref> [--script]       --script: a script click, for pages that ignore real ones
   paws type <tab> <ref|-> <text> [--submit] [--replace]
   paws key <tab> <key>                   Enter, Escape, Tab, Meta+a, ...
   paws goto <tab> <url>
@@ -64,7 +64,7 @@ function argsFor(cmd, pos, flags) {
     case 'snap':
       return { tab: a, full: !!flags.full };
     case 'click':
-      return { tab: a, ref: b };
+      return { tab: a, ref: b, script: !!flags.script };
     case 'type':
       return { tab: a, ref: b === '-' ? undefined : b, text: rest.join(' '), submit: !!flags.submit, replace: !!flags.replace };
     case 'key':
