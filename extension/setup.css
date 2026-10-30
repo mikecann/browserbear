@@ -1,0 +1,168 @@
+:root {
+  --bg: #f5f5f7;
+  --card: #ffffff;
+  --line: rgba(0, 0, 0, 0.08);
+  --text: #1d1d1f;
+  --muted: #6e6e73;
+  --green: #34c759;
+  --red: #ff3b30;
+  --grey: #c7c7cc;
+  --button: rgba(0, 0, 0, 0.06);
+  --button-hover: rgba(0, 0, 0, 0.1);
+  --accent: #0a84ff;
+  --code: rgba(0, 0, 0, 0.05);
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #1e1e1e;
+    --card: #2a2a2a;
+    --line: rgba(255, 255, 255, 0.08);
+    --text: #f2f2f2;
+    --muted: #a1a1a6;
+    --green: #30d158;
+    --red: #ff453a;
+    --grey: #636366;
+    --button: rgba(255, 255, 255, 0.1);
+    --button-hover: rgba(255, 255, 255, 0.16);
+    --code: rgba(255, 255, 255, 0.07);
+  }
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--text);
+  font: 14px/1.4 -apple-system, BlinkMacSystemFont, 'Helvetica Neue', sans-serif;
+}
+
+main {
+  max-width: 560px;
+  margin: 64px auto;
+  padding: 0 24px;
+}
+
+header {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  margin-bottom: 24px;
+}
+
+header img {
+  border-radius: 14px;
+}
+
+h1 {
+  margin: 0;
+  font-size: 20px;
+  font-weight: 600;
+}
+
+#subtitle {
+  margin: 4px 0 0;
+  color: var(--muted);
+  font-size: 15px;
+}
+
+#rows {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  background: var(--card);
+  border-radius: 12px;
+  overflow: hidden;
+}
+
+#rows li {
+  display: flex;
+  align-items: flex-start;
+  gap: 14px;
+  padding: 16px 20px;
+}
+
+#rows li + li {
+  border-top: 1px solid var(--line);
+}
+
+.dot {
+  flex: none;
+  width: 12px;
+  height: 12px;
+  margin-top: 4px;
+  border-radius: 50%;
+  background: var(--grey);
+}
+
+.done .dot {
+  background: var(--green);
+}
+
+.missing .dot {
+  background: var(--red);
+}
+
+.text {
+  flex: 1;
+  min-width: 0;
+}
+
+.text strong {
+  display: block;
+  font-size: 15px;
+  font-weight: 600;
+}
+
+.text p {
+  margin: 2px 0 0;
+  color: var(--muted);
+}
+
+.text code {
+  display: inline-block;
+  margin-top: 8px;
+  padding: 3px 8px;
+  border-radius: 6px;
+  background: var(--code);
+  font: 13px ui-monospace, Menlo, monospace;
+  user-select: all;
+}
+
+.side {
+  flex: none;
+  align-self: center;
+}
+
+.check {
+  color: var(--green);
+  font-size: 18px;
+}
+
+button {
+  font: inherit;
+  color: inherit;
+  border: 0;
+  border-radius: 7px;
+  padding: 5px 14px;
+  background: var(--button);
+  cursor: pointer;
+}
+
+button:hover {
+  background: var(--button-hover);
+}
+
+button.primary {
+  background: var(--accent);
+  color: #fff;
+}
+
+footer {
+  display: flex;
+  justify-content: flex-end;
+  margin-top: 20px;
+}

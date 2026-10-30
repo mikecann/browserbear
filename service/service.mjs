@@ -477,6 +477,10 @@ const server = net.createServer((conn) => {
         profile = { instance: msg.instance, email: msg.email, name: known.name, dir: known.dir, conn, pending: new Map() };
         profiles.set(msg.instance, profile);
         log('hello from', describe(profile), msg.version);
+        // The name agents will find this profile by, for the setup page.
+        // Older extensions answer it with an "unknown op" error that has no
+        // id, which onHostMessage drops.
+        conn.write(line({ type: 'welcome', name: profile.name || null, email: profile.email || null, dir: profile.dir || null }));
         return;
       }
       if (role === 'host') return onHostMessage(profile, msg);

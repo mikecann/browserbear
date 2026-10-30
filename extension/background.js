@@ -15,13 +15,19 @@ const IDLE_DETACH_MS = 30_000;
 
 let port = null;
 const attached = new Map(); // tabId -> idle-detach timer
+// How far the chain to the Mac gets, for the setup page. An error is kept
+// through the 2 s retries until the host really answers, so the page doesn't
+// flicker between "checking" and "missing".
+const link = { host: 'connecting', error: null, service: false, profile: null };
 
 function connect() {
   if (port) return;
   port = chrome.runtime.connectNative(HOST);
   port.onMessage.addListener(onMessage);
   port.onDisconnect.addListener(() => {
-    console.warn('browserbear: host disconnected', chrome.runtime.lastError?.message);
+    const error = chrome.runtime.lastError?.message;
+    console.warn('browserbear: host disconnected', error);
+    Object.assign(link, { host: 'error', error: error || 'host disconnected', service: false, profile: null });
     port = null;
     setTimeout(connect, 2000);
   });
@@ -49,6 +55,19 @@ function post(msg) {
 
 async function onMessage(msg) {
   if (msg.type === 'ping') return post({ type: 'pong' });
+  // From the host: whether it has reached the service (it says so as soon as
+  // it starts, so "up" also means Chrome could start it).
+  if (msg.type === 'service') {
+    Object.assign(link, { host: 'up', error: null, service: msg.up });
+    if (!msg.up) link.profile = null;
+    return;
+  }
+  // From the service, after our hello: the name agents will use for us.
+  if (msg.type === 'welcome') {
+    Object.assign(link, { host: 'up', error: null, service: true, profile: { name: msg.name || null, email: msg.email || null, dir: msg.dir || null } });
+    return;
+  }
+  if (msg.type) return; // some other notice from a newer host or service
   const handler = ops[msg.op];
   try {
     if (!handler) throw new Error(`unknown op ${msg.op}`);
@@ -218,8 +237,32 @@ chrome.debugger.onEvent.addListener(({ tabId }, method, params) => {
   if (method === 'Page.javascriptDialogClosed') post({ type: 'event', event: 'dialogClosed', tabId });
 });
 
+// The setup page: a checklist of what this profile still needs. It opens by
+// itself on first install, and from the toolbar button (the manifest's action
+// has no popup, so a click lands here).
+const SETUP_URL = chrome.runtime.getURL('setup.html');
+
+async function openSetup() {
+  const [tab] = await chrome.tabs.query({ url: SETUP_URL });
+  if (!tab) return chrome.tabs.create({ url: SETUP_URL });
+  await chrome.tabs.update(tab.id, { active: true });
+  await chrome.windows.update(tab.windowId, { focused: true });
+}
+
+chrome.action.onClicked.addListener(() => openSetup());
+
+// The setup page polls this every second or so.
+chrome.runtime.onMessage.addListener((msg, sender, reply) => {
+  if (sender.id !== chrome.runtime.id || msg?.type !== 'setup-status') return;
+  connect(); // in case the worker slept and lost its port
+  reply({ link: { ...link } });
+});
+
 chrome.runtime.onStartup.addListener(connect);
-chrome.runtime.onInstalled.addListener(connect);
+chrome.runtime.onInstalled.addListener(({ reason }) => {
+  connect();
+  if (reason === 'install') openSetup();
+});
 // Alarms wake a sleeping worker, so a lost port gets reopened within a minute
 // even if the reconnect timer died with the worker.
 chrome.alarms.create('browserbear-reconnect', { periodInMinutes: 1 });

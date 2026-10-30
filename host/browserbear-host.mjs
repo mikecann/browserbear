@@ -33,6 +33,14 @@ process.stdin.on('end', () => {
 });
 
 const toChrome = (msg) => process.stdout.write(encodeNative(msg));
+// Tells the extension's setup page how far the chain gets. The first one also
+// proves Chrome managed to start this host.
+let serviceUp = null;
+const sayService = (up) => {
+  if (serviceUp === up) return;
+  serviceUp = up;
+  toChrome({ type: 'service', up });
+};
 
 let started = false;
 function startService() {
@@ -49,6 +57,7 @@ function connect(delay = 0) {
     s.on('connect', () => {
       log('connected to service');
       sock = s;
+      sayService(true);
       if (hello) s.write(line(hello));
       for (const m of queue.splice(0)) if (m !== hello) s.write(line(m));
     });
@@ -60,6 +69,7 @@ function connect(delay = 0) {
     s.on('close', () => {
       if (sock === s) log('service went away');
       sock = null;
+      sayService(false);
       started = false;
       connect(Math.min(5000, delay * 2 || 250));
     });
@@ -67,4 +77,5 @@ function connect(delay = 0) {
 }
 
 log('host up', process.argv.slice(2).join(' '));
+sayService(false);
 connect();

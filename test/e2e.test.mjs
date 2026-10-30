@@ -23,11 +23,13 @@ test('CLI -> service -> host -> fake extension and back', async (t) => {
 
   const host = spawn(process.execPath, [path.join(root, 'host', 'browserbear-host.mjs'), 'chrome-extension://x/'], { env });
   const cdpCalls = [];
+  const notices = []; // { type } messages from the host and service, for the setup page
   let topNode = 99; // what DOM.getNodeForLocation says is at the click point
   const reply = (msg) => host.stdin.write(encodeNative(msg));
   host.stdout.on(
     'data',
     nativeReader((msg) => {
+      if (msg.type) return notices.push(msg);
       const { id, op, args } = msg;
       if (op === 'tabs') return reply({ id, ok: true, result: [{ tabId: 7, url: 'https://studio.youtube.com/', title: 'Studio', active: true }] });
       if (op === 'cdp') {
@@ -67,6 +69,13 @@ test('CLI -> service -> host -> fake extension and back', async (t) => {
     profiles = await browserbear('profiles').catch(() => '');
   }
   assert.match(profiles, /● Work \(me@example\.com, Profile 2\)/);
+  // The setup page hears that the host started, reached the service, and
+  // what agents call this profile.
+  assert.deepEqual(notices, [
+    { type: 'service', up: false },
+    { type: 'service', up: true },
+    { type: 'welcome', name: 'Work', email: 'me@example.com', dir: 'Profile 2' },
+  ]);
 
   assert.match(await browserbear('tabs', '--profile', 'Work'), /7\* Studio <https:\/\/studio\.youtube\.com\/>/);
 

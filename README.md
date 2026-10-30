@@ -47,6 +47,9 @@ folder. For uploads, open
 the extension's Details and turn on "Allow access to file URLs". The extension's id is
 fixed (`iljcldkflmlnmfhbllafbbfnchhoccok`) by the key in its manifest.
 
+The extension opens a setup page when it's first added, and again whenever you
+click its toolbar button. It checks the Mac side, the name agents will use for that
+profile, and file access, and each row turns green by itself once it's done.
 `browserbear profiles` shows which profiles are connected.
 
 ## Use
