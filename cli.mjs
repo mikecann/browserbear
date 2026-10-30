@@ -12,7 +12,7 @@ const USAGE = `browserbear: let agents use your real Chrome profiles
 
   browserbear profiles                          Chrome profiles, and which have BrowserBear connected
   browserbear tabs [--profile p]                open tabs, with ids
-  browserbear open <url> --profile p [--group name]
+  browserbear open <url> --profile p
   browserbear claim <text> [--profile p]        find one of your open tabs by URL or title
   browserbear snap <tab> [--full]               what's on the page (a diff after the first look)
   browserbear click <tab> <ref> [--script]       --script: a script click, for pages that ignore real ones
@@ -46,6 +46,8 @@ function parse(argv) {
     if (a.startsWith('--')) {
       const key = a.slice(2);
       const next = argv[i + 1];
+      // --group is gone (Chrome kept every group on the bookmarks bar), but
+      // still eats its value so old commands don't read it as a URL.
       if (next !== undefined && !next.startsWith('--') && ['profile', 'group'].includes(key)) flags[key] = argv[++i];
       else flags[key] = true;
     } else pos.push(a);
@@ -64,7 +66,7 @@ function argsFor(cmd, pos, flags) {
     case 'tabs':
       return p;
     case 'open':
-      return { ...p, url: a, group: flags.group };
+      return { ...p, url: a };
     case 'claim':
       return { ...p, match: pos.join(' ') };
     case 'snap':

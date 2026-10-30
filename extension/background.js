@@ -5,7 +5,7 @@
 //    service worker alive: an open native port counts as activity),
 //  - says hello with the profile's signed-in account, so agents can ask for
 //    "Work" instead of a number that changes between connects,
-//  - runs a handful of ops: list/open/close tabs, tab groups, raw CDP through
+//  - runs a handful of ops: list/open/close tabs, raw CDP through
 //    chrome.debugger, downloads.
 
 const HOST = 'dev.browserbear.host';
@@ -124,17 +124,21 @@ const ops = {
   // It has to stay visible: Chrome holds back real clicks on tabs you can't
   // see (a click on a background tab took 15 s on 29 Oct), so it's a normal
   // window you can park on another screen, not a minimised one.
-  // `group` puts it in a tab group (Threadbear passes the thread's title).
-  async open({ url, group }) {
+  // No tab groups: Chrome saves every group in a window that closes and pins
+  // it to your bookmarks bar, and syncs it to your other devices. Agents'
+  // groups ("poddle", "crypto", two "poddle"s...) piled up there with no
+  // extension API to delete them (30 Oct). An old caller's `group` is ignored.
+  async open({ url }) {
     const win = await bearWindow();
     let tab;
-    if (win) tab = await chrome.tabs.create({ url, active: true, windowId: win.id });
-    else {
+    if (win) {
+      await ungroupAll(win.id);
+      tab = await chrome.tabs.create({ url, active: true, windowId: win.id });
+    } else {
       const made = await chrome.windows.create({ url, focused: false, width: 1280, height: 900 });
       await chrome.storage.session.set({ bearWindow: made.id });
       tab = made.tabs[0];
     }
-    if (group) await addToGroup(tab, group);
     return tabInfo(await waitForLoad(tab.id));
   },
 
@@ -231,11 +235,11 @@ async function bearWindow() {
   return chrome.windows.get(id).catch(() => null);
 }
 
-async function addToGroup(tab, title) {
-  const [existing] = await chrome.tabGroups.query({ title, windowId: tab.windowId });
-  if (existing) return chrome.tabs.group({ tabIds: [tab.id], groupId: existing.id });
-  const groupId = await chrome.tabs.group({ tabIds: [tab.id], createProperties: { windowId: tab.windowId } });
-  await chrome.tabGroups.update(groupId, { title, color: 'blue' });
+// Groups left in BrowserBear's window by older versions: ungrouping, unlike
+// closing the window, doesn't leave a saved group on your bookmarks bar.
+async function ungroupAll(windowId) {
+  const grouped = (await chrome.tabs.query({ windowId })).filter((t) => t.groupId !== -1);
+  if (grouped.length) await chrome.tabs.ungroup(grouped.map((t) => t.id));
 }
 
 function waitForLoad(tabId, timeoutMs = 30_000) {

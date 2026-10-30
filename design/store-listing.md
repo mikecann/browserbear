@@ -27,7 +27,7 @@ nothing.
 
 - Agents ask for a profile by its name ("Work") instead of guessing, so they don't end
   up in the wrong Google account.
-- Agent tabs open in a window of their own, in a tab group named after the job.
+- Agent tabs open in a window of their own, away from yours.
 - While an agent is working, Chrome shows "BrowserBear started debugging this browser". That's
   Chrome's own notice; BrowserBear stops 30 seconds after the last command and the bar goes.
 - Nothing leaves your Mac. The extension only talks to the BrowserBear service on the same
@@ -48,8 +48,7 @@ tabs in this Chrome profile, through a local companion app.
 - `debugger`: the agent reads the page's accessibility tree and clicks and types in
   the tab, through the Chrome DevTools Protocol. This is the core of what it does.
 - `nativeMessaging`: the only connection, to the BrowserBear service on the same Mac.
-- `tabs`, `tabGroups`: list open tabs so the user can point an agent at one, and keep
-  the agent's own tabs together in a named group.
+- `tabs`: list open tabs so the user can point an agent at one.
 - `downloads`: save a file the agent was asked to fetch, and tell it where it landed.
 - `identity`, `identity.email`: read which Google account this profile is signed into,
   so agents can pick the right profile by account. The email stays on the device.

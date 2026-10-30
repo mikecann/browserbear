@@ -585,9 +585,9 @@ const commands = {
     return out.join('\n');
   },
 
-  async open({ profile, url, group }) {
+  async open({ profile, url }) {
     const p = findProfile(profile);
-    const tab = remember(p.instance, await call(p, 'open', { url, group }, 40_000));
+    const tab = remember(p.instance, await call(p, 'open', { url }, 40_000));
     bearTabs.add(tab.tabId);
     sent(tab.tabId, url);
     const snap = await snapshot(tab.tabId);

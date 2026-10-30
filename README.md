@@ -66,7 +66,7 @@ profile, and file access, and each row turns green by itself once it's done.
 browserbear profiles
 browserbear tabs --profile Work
 browserbear claim studio.youtube.com          # one of your open tabs, and what's on it
-browserbear open https://example.com --profile Work --group "My thread"
+browserbear open https://example.com --profile Work
 browserbear click 1234 e12
 browserbear type 1234 e7 "Hello" --submit
 browserbear upload 1234 e12 ~/talk.mp3         # e12 can be the "Choose files" button
