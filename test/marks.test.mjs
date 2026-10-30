@@ -48,7 +48,7 @@ test("an agent's tab carries its thread's name and state until the thread is don
   await latest((m) => m?.name !== 'agent');
   assert.deepEqual(
     marks.find((m) => m?.name !== 'agent'),
-    { name: 'Poddle: fix the sleep t…', url: 'https://moose-1.ap-southeast-2.convex.site/t/th-1', state: 'working', action: 'opening example.com', stop: true },
+    { name: 'Poddle: fix the sleep t…', url: 'threadbear://thread/th-1', state: 'working', action: 'opening example.com', stop: true },
   );
 
   // Quiet for a moment while the thread carries on: grey, and other agents

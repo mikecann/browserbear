@@ -48,7 +48,7 @@ export function createMarks({ send, log }) {
   const claims = new Map(); // tabId -> { thread, action, at, busy, yours, sent }
   let threads = null; // id -> thread, from tb list; null until it first answers
   let threadsAt = 0;
-  let site; // the Threadbear website, for "Open thread"; null if there isn't one
+  let site; // the Threadbear website, where "Open thread" goes without the Mac app; null if there isn't one
   let loading = null;
 
   function refreshThreads() {
@@ -74,7 +74,8 @@ export function createMarks({ send, log }) {
     const working = c.busy > 0 || now - c.at < WORKING_MS;
     const t = c.thread && threads?.get(c.thread);
     if (c.thread && threads && !t) return null; // archived, or deleted
-    const base = { name: t ? shortName(t.title) : 'agent', url: t && site ? `${site}/t/${t.id}` : null };
+    // The pill's Open thread: the Mac app's link (Threadbear's ThreadLink).
+    const base = { name: t ? shortName(t.title) : 'agent', url: t ? `threadbear://thread/${t.id}` : null };
     if (t) {
       const running = t.status === 'running';
       const needsYou = !running && (t.needsYou || t.needs === 'you');
@@ -155,6 +156,16 @@ export function createMarks({ send, log }) {
     async release(tabId) {
       claims.delete(tabId);
       await send(tabId, null).catch(() => {});
+    },
+    // Opens the thread in the Mac app, with `open` rather than from Chrome,
+    // which would ask first. An app too old to know the link (or none at
+    // all) gets the thread on the website instead.
+    async open(tabId) {
+      const thread = claims.get(tabId)?.thread;
+      if (!thread) return;
+      if ((await run('/usr/bin/open', [`threadbear://thread/${thread}`])) !== null) return;
+      await refreshThreads();
+      if (site) await run('/usr/bin/open', [`${site}/t/${thread}`]);
     },
     async stop(tabId) {
       const c = claims.get(tabId);

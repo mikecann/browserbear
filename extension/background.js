@@ -285,9 +285,9 @@ chrome.tabs.onRemoved.addListener(async (tabId) => {
 chrome.runtime.onMessage.addListener((msg, sender) => {
   if (sender.id !== chrome.runtime.id || msg?.type !== 'mark-action' || !sender.tab) return;
   const tab = sender.tab;
-  if (msg.action === 'open' && msg.url) chrome.tabs.create({ url: msg.url, windowId: tab.windowId, index: tab.index + 1 });
   if (msg.action === 'release') ops.mark({ tabId: tab.id, mark: null }).catch(() => {});
-  if (msg.action === 'stop' || msg.action === 'release') post({ type: 'event', event: 'mark', action: msg.action, tabId: tab.id });
+  // The service opens the thread in Threadbear's Mac app (Chrome would ask first).
+  if (['open', 'stop', 'release'].includes(msg.action)) post({ type: 'event', event: 'mark', action: msg.action, tabId: tab.id });
 });
 
 // The pill is in the page, so it would catch an agent's real clicks (and
@@ -397,7 +397,7 @@ function drawMark(mark, icon) {
       <button class=open>Open thread</button><button class=stop>Stop</button><button class=x title="Leave this tab alone">✕</button></div>`;
     const $ = (sel) => root.querySelector(sel);
     m.parts = { glow: $('.glow'), pill: $('.pill'), dot: $('.dot'), text: $('.text'), open: $('.open'), stop: $('.stop') };
-    const send = (action) => chrome.runtime.sendMessage({ type: 'mark-action', action, url: m.mark?.url }).catch(() => {});
+    const send = (action) => chrome.runtime.sendMessage({ type: 'mark-action', action }).catch(() => {});
     $('.open').onclick = () => send('open');
     $('.stop').onclick = () => send('stop');
     $('.x').onclick = () => send('release');

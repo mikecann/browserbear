@@ -88,7 +88,7 @@ Every tab an agent uses is marked, so you can tell it from yours. The tab's
 title starts with 🐻 and the thread's name, its icon gets a dot (green while
 the agent works in it, amber when it's handed to you, grey while the thread
 has it but isn't using it right now), and a pill in the page says what the
-agent is doing, with Open thread, Stop and ✕ (leave this tab alone). The marks
+agent is doing, with Open thread (in the Threadbear app, or its website without it), Stop and ✕ (leave this tab alone). The marks
 come off when the thread finishes its turn without needing you. The CLI passes
 `THREADBEAR_THREAD_ID` along and the service asks Threadbear's `tb` for the
 thread's name and state; outside Threadbear the tab just says "agent". The

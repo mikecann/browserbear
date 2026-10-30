@@ -837,6 +837,7 @@ function onHostMessage(profile, msg) {
     if (msg.event === 'dialogClosed') state(msg.tabId).dialog = null; // you answered it yourself
     if (msg.event === 'detached') log('detached', msg.tabId, msg.reason);
     // The buttons on the pill in an agent's tab.
+    if (msg.event === 'mark' && msg.action === 'open') marks.open(msg.tabId);
     if (msg.event === 'mark' && msg.action === 'stop') marks.stop(msg.tabId);
     if (msg.event === 'mark' && msg.action === 'release') marks.release(msg.tabId);
     return;
