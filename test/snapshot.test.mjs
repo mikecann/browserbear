@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { RefMap, compact, diff } from '../service/snapshot.mjs';
+import { RefMap, compact, diff, sameApartFromFocus } from '../service/snapshot.mjs';
 import { encodeNative, nativeReader } from '../service/wire.mjs';
 
 // A small made-up page in the shape Accessibility.getFullAXTree returns.
@@ -59,6 +59,15 @@ test('diff shows only what changed, and falls back to the full list when that is
   assert.match(d.text, /^- e1 button "Save"\n\+ e1 button "Save" \[disabled\]\n\(11 unchanged\)$/);
   const elsewhere = ['# B', 'e9 link "Other"'];
   assert.equal(diff(before, elsewhere).full, true);
+});
+
+test('a click that only moved focus counts as changing nothing', () => {
+  const before = ['# BTC', 'e1 link "SELL BTC"', 'e2 checkbox "Agree" [checked]'];
+  assert.equal(sameApartFromFocus(before, ['# BTC', 'e1 link "SELL BTC" [focused]', 'e2 checkbox "Agree" [checked]']), true);
+  assert.equal(sameApartFromFocus(before, ['# BTC', 'e1 link "SELL BTC"', 'e2 checkbox "Agree" [checked, focused]']), true);
+  assert.equal(sameApartFromFocus(before, ['# BTC', 'e1 link "SELL BTC"', 'e2 checkbox "Agree"']), false);
+  assert.equal(sameApartFromFocus(before, [...before, '## Sell order']), false);
+  assert.equal(sameApartFromFocus(null, before), false);
 });
 
 test('native framing round-trips, including split chunks', () => {

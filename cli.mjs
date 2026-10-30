@@ -16,6 +16,7 @@ const USAGE = `browserbear: let agents use your real Chrome profiles
   browserbear claim <text> [--profile p]        find one of your open tabs by URL or title
   browserbear snap <tab> [--full]               what's on the page (a diff after the first look)
   browserbear click <tab> <ref> [--script]       --script: a script click, for pages that ignore real ones
+                                                (a link that ignores a real click gets one by itself)
   browserbear type <tab> <ref|-> <text> [--submit] [--replace]
   browserbear key <tab> <key>                   Enter, Escape, Tab, Meta+a, ...
   browserbear goto <tab> <url>

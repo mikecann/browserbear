@@ -124,3 +124,14 @@ export function diff(before, after) {
   if (text.length >= after.join('\n').length) return { full: true, text: after.join('\n') };
   return { full: false, text: `${text}\n(${after.length - added.length} unchanged)` };
 }
+
+// Whether two snapshots differ only in what has focus. A click focuses what it
+// lands on, so a click the page ignored still changes that much.
+export function sameApartFromFocus(before, after) {
+  if (!before || before.length !== after.length) return false;
+  const unfocus = (l) => l.replace(/ \[([^\]]*)\]$/, (_, f) => {
+    const rest = f.split(', ').filter((x) => x !== 'focused');
+    return rest.length ? ` [${rest.join(', ')}]` : '';
+  });
+  return before.every((l, i) => unfocus(l) === unfocus(after[i]));
+}

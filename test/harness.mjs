@@ -11,12 +11,12 @@ import { encodeNative, nativeReader } from '../service/wire.mjs';
 export const root = path.join(path.dirname(fileURLToPath(import.meta.url)), '..');
 const run = promisify(execFile);
 
-export async function startBear(t, onOp) {
+export async function startBear(t, onOp, extraEnv = {}) {
   // Short path: Unix socket paths are capped at 104 bytes on macOS.
   const home = fs.mkdtempSync(path.join('/tmp', 'browserbear-'));
   const localState = path.join(home, 'Local State');
   fs.writeFileSync(localState, JSON.stringify({ profile: { info_cache: { 'Profile 2': { name: 'Work', user_name: 'me@example.com' } } } }));
-  const env = { ...process.env, BROWSERBEAR_HOME: home, BROWSERBEAR_CHROME_LOCAL_STATE: localState };
+  const env = { ...process.env, BROWSERBEAR_HOME: home, BROWSERBEAR_CHROME_LOCAL_STATE: localState, ...extraEnv };
 
   const host = spawn(process.execPath, [path.join(root, 'host', 'browserbear-host.mjs'), 'chrome-extension://x/'], { env });
   const notices = []; // { type } messages from the host and service, for the setup page

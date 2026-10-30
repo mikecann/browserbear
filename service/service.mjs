@@ -11,7 +11,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { HOME, LOGS, OUT, SOCKET, line, lineReader } from './wire.mjs';
-import { RefMap, compact, diff } from './snapshot.mjs';
+import { RefMap, compact, diff, sameApartFromFocus } from './snapshot.mjs';
 
 fs.mkdirSync(LOGS, { recursive: true, mode: 0o700 });
 fs.mkdirSync(OUT, { recursive: true, mode: 0o700 });
@@ -64,7 +64,7 @@ function call(profile, op, args = {}, timeoutMs = 30_000) {
   return new Promise((resolve, reject) => {
     const timer = setTimeout(() => {
       profile.pending.delete(id);
-      reject(new Error(`${op} timed out after ${timeoutMs / 1000}s in ${describe(profile)}`));
+      reject(Object.assign(new Error(`${op} timed out after ${timeoutMs / 1000}s in ${describe(profile)}`), { timedOut: true }));
     }, timeoutMs);
     profile.pending.set(id, { resolve, reject, timer, tabId: args.tabId });
     profile.conn.write(line({ id, op, args }));
@@ -88,9 +88,71 @@ const state = (tabId) => {
   return tabState.get(tabId);
 };
 
-async function cdp(tabId, method, params, timeoutMs = 20_000) {
-  return call(await ownerOf(tabId), 'cdp', { tabId, method, params }, timeoutMs);
+// How long a command gets before BrowserBear asks why it hasn't come back.
+// An env var so tests needn't wait 20 s.
+const CDP_WAIT_MS = Number(process.env.BROWSERBEAR_CDP_WAIT_MS) || 20_000;
+const PROBE_MS = Math.min(4_000, CDP_WAIT_MS);
+
+async function cdp(tabId, method, params, timeoutMs = CDP_WAIT_MS) {
+  const p = await ownerOf(tabId);
+  // Input has its own short wait, where running out means "probably landed".
+  if (method.startsWith('Input.')) return call(p, 'cdp', { tabId, method, params }, timeoutMs);
+  if (state(tabId).stuck) await stillStuck(p, tabId);
+  try {
+    return await call(p, 'cdp', { tabId, method, params }, timeoutMs);
+  } catch (e) {
+    if (!e.timedOut) throw e;
+    return unstick(p, tabId, method, params, e);
+  }
 }
+
+// Commands that only look, so sending one again can't do anything twice.
+const LOOKS = /^(Accessibility\.get|DOM\.(get|describe|resolve|querySelector)|Page\.(enable|getNavigationHistory|captureScreenshot)$|Runtime\.enable$)/;
+
+// A command that never came back, as every one did for a BTC Markets tab
+// (30 Oct) while the profile's other tabs answered. Two ways that happens:
+//  - The page's own main thread is stuck or flat out (a live chart, a hung
+//    script). Everything that has to go to the page waits behind it, even
+//    attaching again, but Chrome answers the browser-side commands by itself,
+//    so Page.getNavigationHistory still comes back.
+//  - The debugger session is stuck, and even that doesn't come back. A fresh
+//    session (detach; the next command attaches again) clears it.
+// Either way the agent hears which, rather than another 20 s timeout.
+async function unstick(p, tabId, method, params, e) {
+  const history = () => call(p, 'cdp', { tabId, method: 'Page.getNavigationHistory', params: {} }, PROBE_MS);
+  const nav = await history().catch(() => null);
+  if (nav) {
+    // An eval awaiting a slow promise doesn't hold the page up.
+    if (await pageAnswers(p, tabId)) throw new Error(`${e.message}; the page still answers, so it's that command that's slow`);
+    const url = nav.entries[nav.currentIndex]?.url || '';
+    state(tabId).stuck = { url };
+    log('page stuck', tabId, method);
+    throw new Error(stuckPage(tabId, url));
+  }
+  log('session stuck', tabId, method);
+  await call(p, 'detach', { tabId }, PROBE_MS).catch(() => {});
+  if (!(await history().catch(() => null))) {
+    const url = (await call(p, 'tabs').catch(() => [])).find((t) => t.tabId === tabId)?.url || '';
+    throw new Error(`tab ${tabId}'s debugger session is stuck and starting a fresh one didn't help; reopen the page in a new tab: browserbear open ${url || '<url>'}`);
+  }
+  if (LOOKS.test(method)) return call(p, 'cdp', { tabId, method, params }, CDP_WAIT_MS);
+  // It may have run before the session stuck, so it isn't sent again.
+  throw new Error(`tab ${tabId}'s debugger session was stuck, so BrowserBear started a fresh one; ${method} may or may not have run, snap to see before trying again`);
+}
+
+const stuckPage = (tabId, url) =>
+  `tab ${tabId}'s page isn't answering: Chrome is fine, but the page's own scripts are stuck or flat out (a live chart can do this). Try again in a bit, or open it fresh in a new tab: browserbear open ${url || '<url>'}`;
+
+// Once a page has been stuck, a quick look first, so each command after it
+// doesn't wait the full 20 s to say the same thing.
+async function stillStuck(p, tabId) {
+  const s = state(tabId);
+  if (!(await pageAnswers(p, tabId))) throw new Error(stuckPage(tabId, s.stuck.url));
+  s.stuck = null;
+}
+
+const pageAnswers = (p, tabId) =>
+  call(p, 'cdp', { tabId, method: 'Runtime.evaluate', params: { expression: '1' } }, PROBE_MS).then(() => true, () => false);
 
 // Is the element at (x, y) the one we mean, or something inside it? A dialog
 // still animating in, a toast or a transparent overlay can sit on top, and a
@@ -115,6 +177,12 @@ async function hitsTarget(tabId, backendNodeId, at) {
   });
   return result.value ? { ok: false, what: result.value } : { ok: true };
 }
+
+const isLink = async (tabId, backendNodeId) => {
+  const { object } = await cdp(tabId, 'DOM.resolveNode', { backendNodeId });
+  const { result } = await cdp(tabId, 'Runtime.callFunctionOn', { objectId: object.objectId, functionDeclaration: `function () { return !!this.closest?.('a[href]'); }`, returnByValue: true });
+  return result?.value === true;
+};
 
 async function scriptClick(tabId, backendNodeId) {
   const { object } = await cdp(tabId, 'DOM.resolveNode', { backendNodeId });
@@ -547,12 +615,23 @@ const commands = {
 
   async click({ tab, ref, script }) {
     const node = await nodeFor(tab, ref);
+    const before = state(tab).last;
     await markPage(tab);
     const note = await clickNode(tab, node, { script });
     await settleAfterAction(tab);
     let out = await snapshot(tab);
+    const unchanged = !script && sameApartFromFocus(before, state(tab).last);
+    // A link that ignored a real click but takes a script one (BTC Markets'
+    // "SELL BTC", 30 Oct). Following a link twice is harmless, so it's just
+    // done; anything else might be a toggle, so that's left to the agent.
+    if (unchanged && !note && (await isLink(tab, node).catch(() => false))) {
+      await markPage(tab);
+      await scriptClick(tab, node);
+      await settleAfterAction(tab);
+      return `(the real click on that link changed nothing, so it was clicked again by script)\n${await snapshot(tab)}`;
+    }
     // A click that changed nothing visible is often one the page ignored.
-    if (out.endsWith('(no change)') && !script) out += `\n(if that click should have done something: browserbear click ${tab} ${ref} --script)`;
+    if (unchanged) out += `\n(if that click should have done something: browserbear click ${tab} ${ref} --script)`;
     return (note ? note + '\n' : '') + out;
   },
 

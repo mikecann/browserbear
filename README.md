@@ -91,6 +91,18 @@ finds the input and sets the files there. A button whose input only appears when
 it's clicked gets clicked, with the picker caught before it opens. Pages that use
 `showOpenFilePicker` instead of an input can't be filled this way.
 
+When a tab stops answering, BrowserBear works out why instead of timing out
+again and again. If Chrome answers but the page doesn't, the page's own scripts
+are stuck or flat out (a live chart did this on BTC Markets), and the agent is
+told to wait or open the page fresh; after that, each command takes a quick look
+first rather than waiting the full 20 s. If Chrome doesn't answer either, the
+debugger session is stuck, so BrowserBear drops it and starts a fresh one,
+sending the command again only if it just reads the page.
+
+A real click on a link that changes nothing but focus gets clicked again by
+script, since following a link twice is harmless. For anything else that ignores
+a real click, the agent is told about `--script`.
+
 `browserbear help` lists everything.
 
 ## Tests
