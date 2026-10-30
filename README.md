@@ -63,7 +63,17 @@ browserbear click 1234 e12
 browserbear type 1234 e7 "Hello" --submit
 browserbear read 1234                          # page text; long pages go to a file
 browserbear shot 1234                          # prints the PNG path
+browserbear handoff 1234                       # your turn: the tab moves into your window
 ```
+
+Agents work in a window of BrowserBear's own, so they never take over the tab
+you're looking at. When an agent needs you to do something in one of its tabs
+(sign in, pay, approve), `handoff` moves that tab into the Chrome window you
+last used and brings it to the front, since BrowserBear's window may be on a
+screen you aren't looking at. `open` and `goto` say so when a page looks like
+a sign-in. Given a URL, `handoff` finds the agent tab on that page; Threadbear
+does that when you click a link an agent gave you, so you don't end up with
+two tabs of the same sign-in.
 
 `browserbear help` lists everything.
 

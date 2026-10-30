@@ -26,7 +26,10 @@ const USAGE = `browserbear: let agents use your real Chrome profiles
   browserbear download <tab> <url> [filename]
   browserbear dialog <tab> accept|dismiss [text]
   browserbear show <tab>                        bring a tab forward in its window (real clicks need it)
-  browserbear focus <tab> | browserbear close <tab>
+  browserbear handoff <tab|url>                 before asking the user to do something in a tab (sign in,
+                                                pay, approve): moves it from BrowserBear's window into theirs
+                                                and focuses it. A URL finds the agent tab on that page.
+  browserbear close <tab>
   browserbear reload                            reload the extension everywhere after changing it
   browserbear status
 
@@ -74,6 +77,7 @@ function argsFor(cmd, pos, flags) {
     case 'read':
     case 'show':
     case 'focus':
+    case 'handoff':
     case 'close':
       return { tab: a };
     case 'shot':

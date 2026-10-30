@@ -87,10 +87,36 @@ const tabInfo = (t) => ({
   status: t.status,
 });
 
+// Which window is yours, as opposed to BrowserBear's own: the one you last had in
+// front. Kept in session storage because this worker sleeps between jobs;
+// the listener below wakes it for each focus change.
+chrome.windows.onFocusChanged.addListener(async (windowId) => {
+  if (windowId === chrome.windows.WINDOW_ID_NONE) return;
+  const { bearWindow } = await chrome.storage.session.get('bearWindow');
+  if (windowId === bearWindow) return;
+  const win = await chrome.windows.get(windowId).catch(() => null);
+  if (win?.type === 'normal') await chrome.storage.session.set({ userWindow: windowId });
+});
+
+async function userWindow() {
+  const { bearWindow, userWindow: id } = await chrome.storage.session.get(['bearWindow', 'userWindow']);
+  const last = id && (await chrome.windows.get(id).catch(() => null));
+  if (last) return last;
+  // Nothing remembered yet (Chrome just started): the last focused window,
+  // unless that's BrowserBear's, then any other normal one.
+  const focused = await chrome.windows.getLastFocused({ windowTypes: ['normal'] }).catch(() => null);
+  if (focused && focused.id !== bearWindow) return focused;
+  const all = await chrome.windows.getAll({ windowTypes: ['normal'] });
+  return all.find((w) => w.id !== bearWindow) || null;
+}
+
 const ops = {
+  // `agent` marks the tabs an agent opened: in BrowserBear's window, or
+  // handed from there to you.
   async tabs() {
     const tabs = await chrome.tabs.query({});
-    return tabs.map(tabInfo);
+    const { bearWindow, handedOff = [] } = await chrome.storage.session.get(['bearWindow', 'handedOff']);
+    return tabs.map((t) => ({ ...tabInfo(t), agent: t.windowId === bearWindow || handedOff.includes(t.id) }));
   },
 
   // Opens the tab in a window of BrowserBear's own (one per profile, made the first
@@ -128,6 +154,29 @@ const ops = {
     await detach(tabId);
     await chrome.tabs.remove(tabId);
     return true;
+  },
+
+  // For when the agent wants you to do something in a tab (sign in, pay,
+  // approve): BrowserBear's own window may be on a screen you aren't looking
+  // at (a Qantas sign-in sat there unseen, 30 Oct), so the tab moves into
+  // your window, comes to the front and the window is focused. Your own
+  // tabs stay where they are; they just come forward.
+  async handoff({ tabId }) {
+    let tab = await chrome.tabs.get(tabId);
+    const { bearWindow, handedOff = [] } = await chrome.storage.session.get(['bearWindow', 'handedOff']);
+    const agents = tab.windowId === bearWindow;
+    const mine = agents && (await userWindow());
+    if (mine) {
+      // The agent's group label would mean nothing in your window.
+      if (tab.groupId !== -1) await chrome.tabs.ungroup(tabId);
+      [tab] = [].concat(await chrome.tabs.move(tabId, { windowId: mine.id, index: -1 }));
+    }
+    tab = await chrome.tabs.update(tabId, { active: true });
+    await chrome.windows.update(tab.windowId, { focused: true });
+    // Remembered so a link to the same site (Threadbear's ask buttons) can
+    // find this tab again rather than open a second one.
+    if (agents && !handedOff.includes(tabId)) await chrome.storage.session.set({ handedOff: [...handedOff, tabId] });
+    return tabInfo(tab);
   },
 
   async focus({ tabId }) {

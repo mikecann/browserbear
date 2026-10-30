@@ -24,6 +24,7 @@ test('CLI -> service -> host -> fake extension and back', async (t) => {
   const host = spawn(process.execPath, [path.join(root, 'host', 'browserbear-host.mjs'), 'chrome-extension://x/'], { env });
   const cdpCalls = [];
   const notices = []; // { type } messages from the host and service, for the setup page
+  const handedOff = [];
   let topNode = 99; // what DOM.getNodeForLocation says is at the click point
   const reply = (msg) => host.stdin.write(encodeNative(msg));
   host.stdout.on(
@@ -31,7 +32,23 @@ test('CLI -> service -> host -> fake extension and back', async (t) => {
     nativeReader((msg) => {
       if (msg.type) return notices.push(msg);
       const { id, op, args } = msg;
-      if (op === 'tabs') return reply({ id, ok: true, result: [{ tabId: 7, url: 'https://studio.youtube.com/', title: 'Studio', active: true }] });
+      if (op === 'tabs') {
+        return reply({
+          id,
+          ok: true,
+          result: [
+            { tabId: 7, url: 'https://studio.youtube.com/', title: 'Studio', active: true },
+            // An agent's tab, in BrowserBear's window: an id the handoff tests look for.
+            { tabId: 8, url: 'https://login.qantas.com/signin', title: 'Log in', active: true, agent: true },
+          ],
+        });
+      }
+      // Opening the bookings page lands on the sign-in page (tab 8).
+      if (op === 'open') return reply({ id, ok: true, result: { tabId: 8, url: 'https://login.qantas.com/signin', title: 'Log in', active: true } });
+      if (op === 'handoff') {
+        handedOff.push(args.tabId);
+        return reply({ id, ok: true, result: { tabId: args.tabId, url: 'https://login.qantas.com/signin', title: 'Log in' } });
+      }
       if (op === 'cdp') {
         cdpCalls.push(args.method);
         const results = {
@@ -95,6 +112,19 @@ test('CLI -> service -> host -> fake extension and back', async (t) => {
   cdpCalls.length = 0;
   assert.match(await browserbear('click', '7', 'e1'), /div#overlay was on top of it, so that was a script click/);
   assert.equal(cdpCalls.filter((m) => m.startsWith('Input.')).length, 0);
+
+  // A link to the page an agent's tab is on gets that tab, not a new one;
+  // the same site isn't enough, and the user's own tabs (7) are never
+  // matched by URL.
+  assert.match(await browserbear('handoff', 'https://login.qantas.com/signin#top'), /tab 8 is in front of the user/);
+  await assert.rejects(browserbear('handoff', 'https://login.qantas.com/help'), /no agent tab is open on/);
+  await assert.rejects(browserbear('handoff', 'https://studio.youtube.com/'), /no agent tab is open on/);
+  assert.match(await browserbear('handoff', '7'), /tab 7 is in front of the user/);
+  // ...and where the agent sent it, though it redirected to sign in.
+  const bookings = 'https://www.qantas.com/au/en/frequent-flyer/my-account/bookings.html';
+  assert.match(await browserbear('open', bookings, '--profile', 'Work'), /opened tab 8 in Work/);
+  assert.match(await browserbear('handoff', bookings), /tab 8 is in front of the user/);
+  assert.deepEqual(handedOff, [8, 7, 8]);
 
   await assert.rejects(browserbear('click', '7', 'e42'), /unknown ref e42/);
   await assert.rejects(browserbear('tabs', '--profile', 'Personal'), /no connected profile matches "Personal"/);

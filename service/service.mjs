@@ -26,6 +26,7 @@ const profiles = new Map();
 const tabOwner = new Map(); // tabId -> instance
 const bearTabs = new Set(); // tabs BrowserBear opened itself (in its own window)
 const tabState = new Map(); // tabId -> { refs: RefMap, last: string[] | null, dialog }
+const sentTo = new Map(); // tabId -> pages an agent opened or sent it to
 let nextId = 1;
 
 // Chrome's own list of profiles, so "Work" or "Profile 2" or the email
@@ -256,6 +257,52 @@ async function waitForReady(tabId, timeoutMs = 20_000) {
   }
 }
 
+// Sign-in pages are where an agent most often needs you, and where it's
+// easiest to forget that its tab is in a window you may not be looking at.
+const SIGN_IN = `!!document.querySelector('input[type=password]') || /(log|sign)[-_ ]?(in|on)|auth|sso/i.test(location.hostname + location.pathname)`;
+
+async function handoffHint(tabId) {
+  if (!bearTabs.has(tabId)) return '';
+  const signIn = await evaluate(tabId, SIGN_IN).catch(() => false);
+  return signIn
+    ? `\n(this looks like a sign-in page, in BrowserBear's own window, which the user may not be looking at. If they have to sign in: browserbear handoff ${tabId})`
+    : '';
+}
+
+// Pages match without their #fragment.
+const page = (url) => {
+  try {
+    const u = new URL(url);
+    u.hash = '';
+    return u.href;
+  } catch {
+    return null;
+  }
+};
+
+// The agent tab (in BrowserBear's window, or already handed over) on a page:
+// where it is now, or where an agent sent it, since a sign-in redirect
+// leaves it somewhere else (Qantas bookings -> its login page, 30 Oct).
+// Only exact pages: the same site would find an unrelated GitHub tab for a
+// link to a PR.
+async function agentTabFor(url) {
+  const want = page(url);
+  if (!want) throw new Error(`not a tab id or a URL: ${url}`);
+  for (const p of profiles.values()) {
+    for (const t of await call(p, 'tabs')) {
+      remember(p.instance, t);
+      if (!t.agent && !bearTabs.has(t.tabId)) continue;
+      if (page(t.url) === want || sentTo.get(t.tabId)?.has(want)) return t.tabId;
+    }
+  }
+  throw new Error(`no agent tab is open on ${url}`);
+}
+
+function sent(tabId, url) {
+  if (!sentTo.has(tabId)) sentTo.set(tabId, new Set());
+  sentTo.get(tabId).add(page(url));
+}
+
 const remember = (instance, tab) => {
   tabOwner.set(tab.tabId, instance);
   return tab;
@@ -291,7 +338,9 @@ const commands = {
     const p = findProfile(profile);
     const tab = remember(p.instance, await call(p, 'open', { url, group }, 40_000));
     bearTabs.add(tab.tabId);
-    return `opened tab ${tab.tabId} in ${describe(p)}\n${await snapshot(tab.tabId)}`;
+    sent(tab.tabId, url);
+    const snap = await snapshot(tab.tabId);
+    return `opened tab ${tab.tabId} in ${describe(p)}, in BrowserBear's own window\n${snap}${await handoffHint(tab.tabId)}`;
   },
 
   // Find one of Mike's own tabs by a bit of its URL or title.
@@ -349,8 +398,9 @@ const commands = {
     // Page events (the leave-site dialog among them) only arrive once enabled.
     await cdp(tab, 'Page.enable');
     await cdp(tab, 'Page.navigate', { url });
+    sent(tab, url);
     await waitForReady(tab);
-    return snapshot(tab);
+    return (await snapshot(tab)) + (await handoffHint(tab));
   },
 
   // The page's text, for reading rather than acting. Long pages go to a file.
@@ -395,7 +445,25 @@ const commands = {
 
   async show({ tab }) {
     await call(await ownerOf(tab), 'show', { tabId: tab });
-    return `tab ${tab} is at the front of its window`;
+    if (!bearTabs.has(tab)) return `tab ${tab} is at the front of its window`;
+    return `tab ${tab} is at the front of BrowserBear's window, which the user may not be looking at. To have them do something in it: browserbear handoff ${tab}`;
+  },
+
+  // Gives a tab to the user: an agent's tab moves from BrowserBear's window
+  // into theirs, and either way it comes to the front and Chrome is focused.
+  // Given a URL rather than an id, it finds the agent tab already on that
+  // page (Threadbear does this for the link buttons on an agent's asks, so
+  // you don't get a second tab of the same page).
+  async handoff({ tab }) {
+    const tabId = typeof tab === 'number' ? tab : await agentTabFor(tab);
+    const p = await ownerOf(tabId);
+    const t = await call(p, 'handoff', { tabId }).catch((e) => {
+      if (/unknown op/.test(e.message)) throw new Error(`${describe(p)} has an older BrowserBear extension; browserbear reload, then try again`);
+      throw e;
+    });
+    // It's the user's now: no more pulling it forward for real clicks.
+    bearTabs.delete(tabId);
+    return `tab ${tabId} is in front of the user, in their own Chrome window: ${t.title} <${t.url}>\nSay so when you ask them; a link to the same page as well would open a second tab.`;
   },
 
   // After changing the extension's files: reloads it in every connected
@@ -409,11 +477,10 @@ const commands = {
     return `reloading BrowserBear in ${names.join(', ') || 'no profiles'}`;
   },
 
-  async focus({ tab }) {
-    const p = await ownerOf(tab);
-    await call(p, 'focus', { tabId: tab });
-    return `tab ${tab} is in front`;
-  },
+  // Focusing an agent's tab in BrowserBear's window would bring that window
+  // forward wherever it is, which is the handoff problem again; so focus is
+  // handoff, and for your own tabs that just brings them to the front.
+  focus: (args) => commands.handoff(args),
 
   async close({ tab }) {
     const p = await ownerOf(tab);
@@ -421,6 +488,7 @@ const commands = {
     tabState.delete(tab);
     tabOwner.delete(tab);
     bearTabs.delete(tab);
+    sentTo.delete(tab);
     return `closed tab ${tab}`;
   },
 };
@@ -455,7 +523,8 @@ async function onClientMessage(conn, msg) {
   try {
     if (!fn) throw new Error(`unknown command ${msg.cmd}`);
     const args = { ...(msg.args || {}) };
-    if (args.tab !== undefined) args.tab = Number(args.tab);
+    // Left as text when it isn't a number: handoff also takes a URL.
+    if (/^\d+$/.test(String(args.tab))) args.tab = Number(args.tab);
     conn.write(line({ id: msg.id, ok: true, result: await fn(args) }));
   } catch (e) {
     conn.write(line({ id: msg.id, ok: false, error: e.message }));
