@@ -134,13 +134,32 @@ async function nodeFor(tabId, ref) {
 
 const dialogLine = (tabId, d) => `[js ${d.type} "${d.message}" is open; nothing else works until: browserbear dialog ${tabId} accept|dismiss]`;
 
+// Every <input type=file> in the page, keyed by backendNodeId. Hidden ones
+// aren't in the accessibility tree, and they're the ones upload needs.
+async function fileInputs(tabId) {
+  try {
+    const { root } = await cdp(tabId, 'DOM.getDocument', { depth: 0 });
+    const { nodeIds } = await cdp(tabId, 'DOM.querySelectorAll', { nodeId: root.nodeId, selector: 'input[type=file]' });
+    const nodes = await Promise.all(nodeIds.map((nodeId) => cdp(tabId, 'DOM.describeNode', { nodeId }).then((r) => r.node)));
+    return new Map(
+      nodes.map((n) => {
+        const a = {};
+        for (let i = 0; i < (n.attributes?.length || 0); i += 2) a[n.attributes[i]] = n.attributes[i + 1];
+        return [n.backendNodeId, { id: a.id, label: a['aria-label'] || a.title, accept: a.accept, multiple: 'multiple' in a, disabled: 'disabled' in a }];
+      }),
+    );
+  } catch {
+    return new Map(); // a snapshot without them beats no snapshot
+  }
+}
+
 async function snapshot(tabId, { full = false } = {}) {
   const s = state(tabId);
   // A JS dialog freezes the page, so every other call would just time out.
   if (s.dialog) return `tab ${tabId}\n${dialogLine(tabId, s.dialog)}`;
   await cdp(tabId, 'Page.enable');
-  const { nodes } = await cdp(tabId, 'Accessibility.getFullAXTree');
-  const lines = compact(nodes, s.refs);
+  const [{ nodes }, files] = await Promise.all([cdp(tabId, 'Accessibility.getFullAXTree'), fileInputs(tabId)]);
+  const lines = compact(nodes, s.refs, files);
   const out = full ? { full: true, text: lines.join('\n') } : diff(s.last, lines);
   s.last = lines;
   const tab = (await call(await ownerOf(tabId), 'tabs')).find((t) => t.tabId === tabId);
@@ -206,6 +225,127 @@ const SCRIPT_CLICK = `function () {
   this.dispatchEvent(new MouseEvent('mouseup', o));
   this.click();
 }`;
+
+// What upload sets files on. Sites hide the real <input type=file> behind a
+// styled button or label (Adobe Podcast Enhance, 30 Oct), so a target that
+// isn't one is followed to the input it stands for: a label's control, one
+// inside it, or one named by for= or aria-controls.
+const LINKED_FILE_INPUT = `function () {
+  const isFile = (el) => el instanceof HTMLInputElement && el.type === 'file';
+  if (isFile(this)) return this;
+  if (isFile(this.control)) return this.control;
+  const inside = this.querySelector?.('input[type=file]');
+  if (inside) return inside;
+  const label = this.closest?.('label');
+  if (label && isFile(label.control)) return label.control;
+  for (const attr of ['for', 'aria-controls']) {
+    const el = this.getAttribute?.(attr) && this.getRootNode().getElementById?.(this.getAttribute(attr));
+    if (isFile(el)) return el;
+  }
+  return null;
+}`;
+
+// Failing that, click the target with the file picker caught: most "Choose
+// files" buttons call input.click() (or showPicker()) on a hidden input, often
+// one made on the spot and never added to the page. The patched methods hand
+// back that input instead of opening Chrome's picker, which a CDP click
+// couldn't open anyway (no user gesture). Resolves to the input, or to a
+// string when the page uses showOpenFilePicker, which no input can fill.
+const CLICKED_FILE_INPUT = `function (waitMs) {
+  const proto = HTMLInputElement.prototype;
+  const { click, showPicker } = proto;
+  const openFilePicker = window.showOpenFilePicker;
+  let got = null;
+  proto.click = function () {
+    if (this.type !== 'file') return click.call(this);
+    got = this;
+  };
+  proto.showPicker = function () {
+    if (this.type !== 'file') return showPicker.call(this);
+    got = this;
+  };
+  if (openFilePicker) {
+    window.showOpenFilePicker = () => {
+      got = 'showOpenFilePicker';
+      return Promise.reject(new DOMException('The user aborted a request.', 'AbortError'));
+    };
+  }
+  // A click that reaches a file input by dispatch rather than click().
+  const onClick = (e) => {
+    const el = e.composedPath()[0];
+    if (el instanceof HTMLInputElement && el.type === 'file') {
+      got ||= el;
+      e.preventDefault();
+    }
+  };
+  document.addEventListener('click', onClick, true);
+  const restore = () => {
+    proto.click = click;
+    proto.showPicker = showPicker;
+    if (openFilePicker) window.showOpenFilePicker = openFilePicker;
+    document.removeEventListener('click', onClick, true);
+  };
+  try {
+    (${SCRIPT_CLICK}).call(this);
+  } catch (e) {
+    restore();
+    throw e;
+  }
+  // Handlers can be async (a lazy-loaded uploader), so give them a moment.
+  return new Promise((resolve) => {
+    const until = Date.now() + waitMs;
+    const poll = () => {
+      if (got || Date.now() > until) {
+        restore();
+        resolve(got);
+      } else setTimeout(poll, 25);
+    };
+    poll();
+  });
+}`;
+
+// Last resort: the file input nearest the target in the page.
+const NEAREST_FILE_INPUT = `function () {
+  for (let el = this.parentElement; el; el = el.parentElement) {
+    const input = el.querySelector('input[type=file]');
+    if (input) return input;
+  }
+  return null;
+}`;
+
+const isRef = (target) => /^e\d+$/.test(target);
+
+// A ref from a snapshot, or a CSS selector (for a page you've read the
+// source of); either way a remote object to work on.
+async function targetObject(tabId, target) {
+  if (isRef(target)) {
+    const { object } = await cdp(tabId, 'DOM.resolveNode', { backendNodeId: await nodeFor(tabId, target) });
+    return object.objectId;
+  }
+  const r = await cdp(tabId, 'Runtime.evaluate', { expression: `document.querySelector(${JSON.stringify(target)})` });
+  if (r.exceptionDetails) throw new Error(`"${target}" is neither a ref (e12) nor a CSS selector that works: ${r.exceptionDetails.exception?.description || r.exceptionDetails.text}`);
+  if (!r.result.objectId) throw new Error(`nothing in tab ${tabId} matches the selector "${target}"`);
+  return r.result.objectId;
+}
+
+const objectResult = (r) => (r.exceptionDetails ? null : r.result);
+
+// The file input behind a target, and a few words on how it was found.
+async function fileInputFor(tabId, target) {
+  const objectId = await targetObject(tabId, target);
+  const call = (functionDeclaration, args = [], extra = {}) =>
+    cdp(tabId, 'Runtime.callFunctionOn', { objectId, functionDeclaration, arguments: args, ...extra }).then(objectResult);
+  const linked = await call(LINKED_FILE_INPUT);
+  if (linked?.objectId) return { objectId: linked.objectId, how: '' };
+  const clicked = await call(CLICKED_FILE_INPUT, [{ value: 1500 }], { awaitPromise: true });
+  if (clicked?.value === 'showOpenFilePicker') {
+    throw new Error(`${target} opens the page's showOpenFilePicker, which takes no files from upload; a real click and the macOS Open sheet (computercub) is the way in`);
+  }
+  if (clicked?.objectId) return { objectId: clicked.objectId, how: `the file input ${target} opens when clicked` };
+  const nearest = await call(NEAREST_FILE_INPUT);
+  if (nearest?.objectId) return { objectId: nearest.objectId, how: `the file input nearest ${target}; it opened nothing when clicked, so check this is the right one` };
+  throw new Error(`no file input goes with ${target}: it isn't one, has none inside or linked to it, opened none when clicked, and the page has none`);
+}
 
 const KEYS = {
   Enter: { code: 'Enter', keyCode: 13, text: '\r' },
@@ -288,14 +428,16 @@ const page = (url) => {
 async function agentTabFor(url) {
   const want = page(url);
   if (!want) throw new Error(`not a tab id or a URL: ${url}`);
-  for (const p of profiles.values()) {
-    for (const t of await call(p, 'tabs')) {
-      remember(p.instance, t);
-      if (!t.agent && !bearTabs.has(t.tabId)) continue;
-      if (page(t.url) === want || sentTo.get(t.tabId)?.has(want)) return t.tabId;
-    }
-  }
-  throw new Error(`no agent tab is open on ${url}`);
+  // Where agents sent tabs is known here, so that's checked without asking
+  // Chrome: listing every profile's tabs can take seconds while their
+  // extensions wake, and Threadbear is waiting to open the link.
+  for (const [tabId, pages] of sentTo) if (pages.has(want) && profiles.has(tabOwner.get(tabId))) return tabId;
+  const lists = await Promise.all(
+    [...profiles.values()].map((p) => call(p, 'tabs').then((tabs) => tabs.map((t) => remember(p.instance, t)), () => [])),
+  );
+  const hit = lists.flat().find((t) => (t.agent || bearTabs.has(t.tabId)) && page(t.url) === want);
+  if (!hit) throw new Error(`no agent tab is open on ${url}`);
+  return hit.tabId;
 }
 
 function sent(tabId, url) {
@@ -425,10 +567,16 @@ const commands = {
   cdp: ({ tab, method, params }) => cdp(tab, method, params ? JSON.parse(params) : {}),
 
   async upload({ tab, ref, files }) {
-    const backendNodeId = await nodeFor(tab, ref);
-    await cdp(tab, 'DOM.setFileInputFiles', { backendNodeId, files: files.map((f) => path.resolve(f)) });
+    if (!files?.length) throw new Error('say which files to upload');
+    const paths = files.map((f) => path.resolve(f));
+    const missing = paths.filter((f) => !fs.existsSync(f));
+    if (missing.length) throw new Error(`no such file: ${missing.join(', ')}`);
+    const { objectId, how } = await fileInputFor(tab, ref);
+    // Fires the input and change events a real pick would.
+    await cdp(tab, 'DOM.setFileInputFiles', { objectId, files: paths });
     await settle();
-    return snapshot(tab);
+    const note = `(${paths.length === 1 ? path.basename(paths[0]) : `${paths.length} files`} set on ${how || (isRef(ref) ? ref : `"${ref}"`)})`;
+    return `${note}\n${await snapshot(tab)}`;
   },
 
   async download({ tab, url, filename }) {
@@ -459,8 +607,11 @@ const commands = {
     const p = await ownerOf(tabId);
     const t = await call(p, 'handoff', { tabId }).catch((e) => {
       if (/unknown op/.test(e.message)) throw new Error(`${describe(p)} has an older BrowserBear extension; browserbear reload, then try again`);
+      // You closed the tab an agent had sent there: forget it, look again.
+      if (typeof tab === 'string' && /no tab with id/i.test(e.message) && sentTo.delete(tabId)) return null;
       throw e;
     });
+    if (!t) return commands.handoff({ tab });
     // It's the user's now: no more pulling it forward for real clicks.
     bearTabs.delete(tabId);
     return `tab ${tabId} is in front of the user, in their own Chrome window: ${t.title} <${t.url}>\nSay so when you ask them; a link to the same page as well would open a second tab.`;
