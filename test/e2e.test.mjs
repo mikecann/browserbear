@@ -16,12 +16,12 @@ const run = promisify(execFile);
 
 test('CLI -> service -> host -> fake extension and back', async (t) => {
   // Short path: Unix socket paths are capped at 104 bytes on macOS.
-  const home = fs.mkdtempSync(path.join('/tmp', 'paws-'));
+  const home = fs.mkdtempSync(path.join('/tmp', 'browserbear-'));
   const localState = path.join(home, 'Local State');
   fs.writeFileSync(localState, JSON.stringify({ profile: { info_cache: { 'Profile 2': { name: 'Work', user_name: 'me@example.com' } } } }));
-  const env = { ...process.env, PAWS_HOME: home, PAWS_CHROME_LOCAL_STATE: localState };
+  const env = { ...process.env, BROWSERBEAR_HOME: home, BROWSERBEAR_CHROME_LOCAL_STATE: localState };
 
-  const host = spawn(process.execPath, [path.join(root, 'host', 'paws-host.mjs'), 'chrome-extension://x/'], { env });
+  const host = spawn(process.execPath, [path.join(root, 'host', 'browserbear-host.mjs'), 'chrome-extension://x/'], { env });
   const cdpCalls = [];
   let topNode = 99; // what DOM.getNodeForLocation says is at the click point
   const reply = (msg) => host.stdin.write(encodeNative(msg));
@@ -52,9 +52,9 @@ test('CLI -> service -> host -> fake extension and back', async (t) => {
   );
   reply({ type: 'hello', instance: 'inst-1', email: 'me@example.com', version: 'test' });
 
-  const paws = (...a) => run(process.execPath, [path.join(root, 'cli.mjs'), ...a], { env }).then((r) => r.stdout.trim());
+  const browserbear = (...a) => run(process.execPath, [path.join(root, 'cli.mjs'), ...a], { env }).then((r) => r.stdout.trim());
   t.after(async () => {
-    const status = JSON.parse(await paws('status').catch(() => '{}'));
+    const status = JSON.parse(await browserbear('status').catch(() => '{}'));
     host.kill();
     if (status.pid) process.kill(status.pid);
     fs.rmSync(home, { recursive: true, force: true });
@@ -64,17 +64,17 @@ test('CLI -> service -> host -> fake extension and back', async (t) => {
   let profiles = '';
   for (let i = 0; i < 40 && !profiles.includes('●'); i++) {
     await new Promise((r) => setTimeout(r, 150));
-    profiles = await paws('profiles').catch(() => '');
+    profiles = await browserbear('profiles').catch(() => '');
   }
   assert.match(profiles, /● Work \(me@example\.com, Profile 2\)/);
 
-  assert.match(await paws('tabs', '--profile', 'Work'), /7\* Studio <https:\/\/studio\.youtube\.com\/>/);
+  assert.match(await browserbear('tabs', '--profile', 'Work'), /7\* Studio <https:\/\/studio\.youtube\.com\/>/);
 
-  const snap = await paws('claim', 'studio');
+  const snap = await browserbear('claim', 'studio');
   assert.match(snap, /tab 7: Studio/);
   assert.match(snap, /e1 button "Upload"/);
 
-  const after = await paws('click', '7', 'e1');
+  const after = await browserbear('click', '7', 'e1');
   assert.match(after, /\(no change\)/);
   assert.deepEqual(
     cdpCalls.filter((m) => m.startsWith('Input.')),
@@ -84,9 +84,9 @@ test('CLI -> service -> host -> fake extension and back', async (t) => {
   // Something covering the button: no real click, a script click instead.
   topNode = 55;
   cdpCalls.length = 0;
-  assert.match(await paws('click', '7', 'e1'), /div#overlay was on top of it, so that was a script click/);
+  assert.match(await browserbear('click', '7', 'e1'), /div#overlay was on top of it, so that was a script click/);
   assert.equal(cdpCalls.filter((m) => m.startsWith('Input.')).length, 0);
 
-  await assert.rejects(paws('click', '7', 'e42'), /unknown ref e42/);
-  await assert.rejects(paws('tabs', '--profile', 'Personal'), /no connected profile matches "Personal"/);
+  await assert.rejects(browserbear('click', '7', 'e42'), /unknown ref e42/);
+  await assert.rejects(browserbear('tabs', '--profile', 'Personal'), /no connected profile matches "Personal"/);
 });

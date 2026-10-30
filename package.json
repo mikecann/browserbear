@@ -1,9 +1,9 @@
 {
-  "name": "paws",
+  "name": "browserbear",
   "version": "0.1.0",
   "description": "Let your local AI agents use your real Chrome profiles",
   "type": "module",
-  "bin": { "paws": "cli.mjs" },
+  "bin": { "browserbear": "cli.mjs" },
   "scripts": { "test": "node --test" },
   "engines": { "node": ">=22" },
   "license": "MIT"

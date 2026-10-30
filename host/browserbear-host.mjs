@@ -1,4 +1,4 @@
-// Native messaging host. Chrome starts one of these per profile whose Paws
+// Native messaging host. Chrome starts one of these per profile whose BrowserBear
 // extension calls connectNative, and kills it when the port closes. It just
 // relays: Chrome frames on stdin/stdout <-> JSON lines on the service socket.
 // It never exits on its own while Chrome is connected, because an open port is

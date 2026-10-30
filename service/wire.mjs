@@ -1,11 +1,11 @@
-// The two wire formats Paws speaks, and where its files live.
+// The two wire formats BrowserBear speaks, and where its files live.
 //  - Chrome native messaging: 4-byte little-endian length, then JSON.
 //  - Everything on the local socket: one JSON object per line.
 import os from 'node:os';
 import path from 'node:path';
 
-export const HOME = process.env.PAWS_HOME || path.join(os.homedir(), 'Library', 'Application Support', 'Paws');
-export const SOCKET = path.join(HOME, 'paws.sock');
+export const HOME = process.env.BROWSERBEAR_HOME || path.join(os.homedir(), 'Library', 'Application Support', 'BrowserBear');
+export const SOCKET = path.join(HOME, 'browserbear.sock');
 export const LOGS = path.join(HOME, 'logs');
 export const OUT = path.join(HOME, 'out'); // screenshots and page dumps
 

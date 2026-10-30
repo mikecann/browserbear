@@ -1,5 +1,5 @@
 #!/bin/sh
-# Puts site/public live at paws.mikecann.app (a Cloudflare Worker on Mike's account), with
+# Puts site/public live at browserbear.mikecann.app (a Cloudflare Worker on Mike's account), with
 # a pinned wrangler so a broken global install can't stop a deploy. The privacy page is
 # built from ../PRIVACY.md by hand for now: update both together.
 set -eu

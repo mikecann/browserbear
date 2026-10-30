@@ -13,6 +13,6 @@ const m = JSON.parse(fs.readFileSync(p, "utf8")); delete m.key;
 fs.writeFileSync(p, JSON.stringify(m, null, 2) + "\n");
 ' "$out/extension/manifest.json"
 version=$(node -p 'require(process.argv[1]).version' "$out/extension/manifest.json")
-rm -f "$out/paws-$version.zip"
-(cd "$out/extension" && zip -qr -X "../paws-$version.zip" . -x '.DS_Store')
-echo "$out/paws-$version.zip"
+rm -f "$out/browserbear-$version.zip"
+(cd "$out/extension" && zip -qr -X "../browserbear-$version.zip" . -x '.DS_Store')
+echo "$out/browserbear-$version.zip"

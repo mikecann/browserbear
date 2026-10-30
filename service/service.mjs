@@ -1,4 +1,4 @@
-// The Paws service: one per Mac, on a Unix socket. Native hosts (one per
+// The BrowserBear service: one per Mac, on a Unix socket. Native hosts (one per
 // Chrome profile with the extension) and clients (the CLI, Threadbear) both
 // connect here. Hosts say hello first; anything else is a client sending
 // { id, cmd, args } and getting back { id, ok, result | error }.
@@ -18,13 +18,13 @@ const logFile = fs.createWriteStream(path.join(LOGS, 'service.log'), { flags: 'a
 const log = (...a) => logFile.write(`${new Date().toISOString()} ${a.join(' ')}\n`);
 
 const LOCAL_STATE =
-  process.env.PAWS_CHROME_LOCAL_STATE || path.join(os.homedir(), 'Library', 'Application Support', 'Google', 'Chrome', 'Local State');
+  process.env.BROWSERBEAR_CHROME_LOCAL_STATE || path.join(os.homedir(), 'Library', 'Application Support', 'Google', 'Chrome', 'Local State');
 const SETTLE_MS = 600; // after an action, before the follow-up snapshot
 
 // instance -> { conn, email, name, dir, pending: Map<id, {resolve, reject, timer}> }
 const profiles = new Map();
 const tabOwner = new Map(); // tabId -> instance
-const pawsTabs = new Set(); // tabs Paws opened itself (in its own window)
+const bearTabs = new Set(); // tabs BrowserBear opened itself (in its own window)
 const tabState = new Map(); // tabId -> { refs: RefMap, last: string[] | null, dialog }
 let nextId = 1;
 
@@ -77,7 +77,7 @@ async function ownerOf(tabId) {
     for (const t of tabs) tabOwner.set(t.tabId, p.instance);
   }
   const found = profiles.get(tabOwner.get(tabId));
-  if (!found) throw new Error(`no tab ${tabId} in any connected profile (paws tabs lists them)`);
+  if (!found) throw new Error(`no tab ${tabId} in any connected profile (browserbear tabs lists them)`);
   return found;
 }
 
@@ -131,7 +131,7 @@ async function nodeFor(tabId, ref) {
   return backendNodeId;
 }
 
-const dialogLine = (tabId, d) => `[js ${d.type} "${d.message}" is open; nothing else works until: paws dialog ${tabId} accept|dismiss]`;
+const dialogLine = (tabId, d) => `[js ${d.type} "${d.message}" is open; nothing else works until: browserbear dialog ${tabId} accept|dismiss]`;
 
 async function snapshot(tabId, { full = false } = {}) {
   const s = state(tabId);
@@ -158,13 +158,13 @@ async function center(tabId, backendNodeId) {
 }
 
 // Chrome holds back real input on tabs you can't see (15 s for one mouse
-// event on a background tab, 29 Oct), so: Paws's own tabs are brought to the
-// front of Paws's window; your tabs are never pulled forward behind your back,
+// event on a background tab, 29 Oct), so: BrowserBear's own tabs are brought to the
+// front of BrowserBear's window; your tabs are never pulled forward behind your back,
 // and get a script click instead, which most sites accept.
 async function clickNode(tabId, backendNodeId, { script = false } = {}) {
   const p = await ownerOf(tabId);
   let tab = (await call(p, 'tabs')).find((t) => t.tabId === tabId);
-  if (!tab?.active && pawsTabs.has(tabId)) tab = await call(p, 'show', { tabId });
+  if (!tab?.active && bearTabs.has(tabId)) tab = await call(p, 'show', { tabId });
   if (script) {
     await scriptClick(tabId, backendNodeId);
     return '(script click, as asked)';
@@ -172,7 +172,7 @@ async function clickNode(tabId, backendNodeId, { script = false } = {}) {
   const at = tab?.active ? await center(tabId, backendNodeId) : null;
   if (!at) {
     await scriptClick(tabId, backendNodeId);
-    return tab?.active ? '' : `(tab ${tabId} is in the background, so that was a script click; paws show ${tabId} brings it forward for a real one)`;
+    return tab?.active ? '' : `(tab ${tabId} is in the background, so that was a script click; browserbear show ${tabId} brings it forward for a real one)`;
   }
   const hit = await hitsTarget(tabId, backendNodeId, at);
   if (!hit.ok) {
@@ -290,7 +290,7 @@ const commands = {
   async open({ profile, url, group }) {
     const p = findProfile(profile);
     const tab = remember(p.instance, await call(p, 'open', { url, group }, 40_000));
-    pawsTabs.add(tab.tabId);
+    bearTabs.add(tab.tabId);
     return `opened tab ${tab.tabId} in ${describe(p)}\n${await snapshot(tab.tabId)}`;
   },
 
@@ -318,7 +318,7 @@ const commands = {
     await settle();
     let out = await snapshot(tab);
     // A click that changed nothing visible is often one the page ignored.
-    if (out.endsWith('(no change)') && !script) out += `\n(if that click should have done something: paws click ${tab} ${ref} --script)`;
+    if (out.endsWith('(no change)') && !script) out += `\n(if that click should have done something: browserbear click ${tab} ${ref} --script)`;
     return (note ? note + '\n' : '') + out;
   },
 
@@ -371,7 +371,7 @@ const commands = {
 
   eval: ({ tab, js }) => evaluate(tab, js),
 
-  // Raw CDP, for debugging Paws itself and for anything it doesn't wrap yet.
+  // Raw CDP, for debugging BrowserBear itself and for anything it doesn't wrap yet.
   cdp: ({ tab, method, params }) => cdp(tab, method, params ? JSON.parse(params) : {}),
 
   async upload({ tab, ref, files }) {
@@ -406,7 +406,7 @@ const commands = {
       await call(p, 'reload').catch(() => {});
       names.push(describe(p));
     }
-    return `reloading Paws in ${names.join(', ') || 'no profiles'}`;
+    return `reloading BrowserBear in ${names.join(', ') || 'no profiles'}`;
   },
 
   async focus({ tab }) {
@@ -420,7 +420,7 @@ const commands = {
     await call(p, 'close', { tabId: tab });
     tabState.delete(tab);
     tabOwner.delete(tab);
-    pawsTabs.delete(tab);
+    bearTabs.delete(tab);
     return `closed tab ${tab}`;
   },
 };

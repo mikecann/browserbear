@@ -1,4 +1,4 @@
-// Paws extension: a thin pipe between the Paws service on the Mac and this
+// BrowserBear extension: a thin pipe between the BrowserBear service on the Mac and this
 // Chrome profile. All the page smarts (snapshots, refs, clicking) live in the
 // service, so this file rarely has to change. It only:
 //  - keeps a native-messaging port open to the host (which also keeps this
@@ -8,7 +8,7 @@
 //  - runs a handful of ops: list/open/close tabs, tab groups, raw CDP through
 //    chrome.debugger, downloads.
 
-const HOST = 'dev.paws.host';
+const HOST = 'dev.browserbear.host';
 // Detach the debugger this long after a tab's last command, so Chrome's
 // "started debugging this browser" bar goes away between jobs.
 const IDLE_DETACH_MS = 30_000;
@@ -21,7 +21,7 @@ function connect() {
   port = chrome.runtime.connectNative(HOST);
   port.onMessage.addListener(onMessage);
   port.onDisconnect.addListener(() => {
-    console.warn('paws: host disconnected', chrome.runtime.lastError?.message);
+    console.warn('browserbear: host disconnected', chrome.runtime.lastError?.message);
     port = null;
     setTimeout(connect, 2000);
   });
@@ -43,7 +43,7 @@ function post(msg) {
   try {
     port?.postMessage(msg);
   } catch (e) {
-    console.warn('paws: post failed', e);
+    console.warn('browserbear: post failed', e);
   }
 }
 
@@ -74,19 +74,19 @@ const ops = {
     return tabs.map(tabInfo);
   },
 
-  // Opens the tab in a window of Paws's own (one per profile, made the first
+  // Opens the tab in a window of BrowserBear's own (one per profile, made the first
   // time and reused), so agents never take over the tab you're looking at.
   // It has to stay visible: Chrome holds back real clicks on tabs you can't
   // see (a click on a background tab took 15 s on 29 Oct), so it's a normal
   // window you can park on another screen, not a minimised one.
   // `group` puts it in a tab group (Threadbear passes the thread's title).
   async open({ url, group }) {
-    const win = await pawsWindow();
+    const win = await bearWindow();
     let tab;
     if (win) tab = await chrome.tabs.create({ url, active: true, windowId: win.id });
     else {
       const made = await chrome.windows.create({ url, focused: false, width: 1280, height: 900 });
-      await chrome.storage.session.set({ pawsWindow: made.id });
+      await chrome.storage.session.set({ bearWindow: made.id });
       tab = made.tabs[0];
     }
     if (group) await addToGroup(tab, group);
@@ -135,8 +135,8 @@ const ops = {
   },
 };
 
-async function pawsWindow() {
-  const { pawsWindow: id } = await chrome.storage.session.get('pawsWindow');
+async function bearWindow() {
+  const { bearWindow: id } = await chrome.storage.session.get('bearWindow');
   if (!id) return null;
   return chrome.windows.get(id).catch(() => null);
 }
@@ -222,6 +222,6 @@ chrome.runtime.onStartup.addListener(connect);
 chrome.runtime.onInstalled.addListener(connect);
 // Alarms wake a sleeping worker, so a lost port gets reopened within a minute
 // even if the reconnect timer died with the worker.
-chrome.alarms.create('paws-reconnect', { periodInMinutes: 1 });
+chrome.alarms.create('browserbear-reconnect', { periodInMinutes: 1 });
 chrome.alarms.onAlarm.addListener(connect);
 connect();

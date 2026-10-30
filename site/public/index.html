@@ -1,19 +1,19 @@
 <!doctype html>
 <html lang="en"><head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Paws: let your AI agents use your real Chrome</title>
-<meta name="description" content="Paws lets the AI agents on your Mac use your real Chrome profiles: your sign-ins and the tabs you already have open.">
+<title>BrowserBear: let your AI agents use your real Chrome</title>
+<meta name="description" content="BrowserBear lets the AI agents on your Mac use your real Chrome profiles: your sign-ins and the tabs you already have open.">
 <link rel="icon" href="/icon.png"><link rel="stylesheet" href="/style.css">
 </head><body><main>
-<header><img src="/icon.png" alt=""><h1>Paws</h1></header>
+<header><img src="/icon.png" alt=""><h1>BrowserBear</h1></header>
 <p class="lead">Lets the AI agents on your Mac use your real Chrome: the profiles you're signed into and the tabs you already have open.</p>
 
 <p>So I kept watching my agents have a bit of a rough time in Chrome. They'd open the
 wrong profile, end up in the wrong Google account, or the connection would just drop
-halfway through a job. So I made Paws, a little Chrome extension plus a service on your
+halfway through a job. So I made BrowserBear, a little Chrome extension plus a service on your
 Mac that any agent can drive from the command line.</p>
 
-<img class="shot" src="/screenshot.png" alt="paws profiles, paws claim and paws click in a terminal">
+<img class="shot" src="/screenshot.png" alt="browserbear profiles, browserbear claim and browserbear click in a terminal">
 
 <p>Your agent asks for a profile by its name or email ("Work"), so it ends up in the
 right account. It can use a tab you already have open, or open its own in a separate
@@ -25,19 +25,19 @@ context. Everything stays on your Mac, there's no server and no account.</p>
 hopefully it's useful to you too!</p>
 
 <h2>Install</h2>
-<pre>git clone https://github.com/mikecann/paws
-cd paws &amp;&amp; ./scripts/install.sh</pre>
+<pre>git clone https://github.com/mikecann/browserbear
+cd browserbear &amp;&amp; ./scripts/install.sh</pre>
 <p>Then add the extension to each Chrome profile you want agents to use. It's on its way
 to the Chrome Web Store; until then, load the repo's <code>extension</code> folder from
 <code>chrome://extensions</code> with Developer mode on.</p>
 
 <h2>Use</h2>
-<pre>paws profiles
-paws claim studio.youtube.com
-paws click 812 e9
-paws type 812 e4 "hello" --submit</pre>
-<p><code>paws help</code> lists the rest. The code and docs are on
-<a href="https://github.com/mikecann/paws">GitHub</a>.</p>
+<pre>browserbear profiles
+browserbear claim studio.youtube.com
+browserbear click 812 e9
+browserbear type 812 e4 "hello" --submit</pre>
+<p><code>browserbear help</code> lists the rest. The code and docs are on
+<a href="https://github.com/mikecann/browserbear">GitHub</a>.</p>
 
 <footer>Made by <a href="https://mikecann.blog">Mike Cann</a>. MIT licence. <a href="/privacy/">Privacy</a>.</footer>
 </main></body></html>
