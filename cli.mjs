@@ -102,15 +102,25 @@ function argsFor(cmd, pos, flags) {
 function request(msg, { attempt = 0 } = {}) {
   return new Promise((resolve, reject) => {
     const s = net.createConnection(SOCKET);
+    let answered = false;
     s.on('connect', () => s.write(line(msg)));
     s.on(
       'data',
       lineReader((reply) => {
+        answered = true;
         s.end();
         reply.ok ? resolve(reply.result) : reject(new Error(reply.error));
       }),
     );
+    // The service restarts itself when its code changes; a request that
+    // caught it on the way out goes to the new one.
+    s.on('close', () => {
+      if (answered) return;
+      if (attempt < 20) setTimeout(() => request(msg, { attempt: attempt + 1 }).then(resolve, reject), 250);
+      else reject(new Error('the BrowserBear service closed the connection without answering'));
+    });
     s.on('error', (e) => {
+      answered = true; // handled here, not by close
       if (attempt < 20 && (e.code === 'ENOENT' || e.code === 'ECONNREFUSED')) {
         // Chrome's hosts normally start the service; start it here too so the
         // CLI can at least say which profiles aren't connected. The service
@@ -125,16 +135,19 @@ function request(msg, { attempt = 0 } = {}) {
   });
 }
 
+// exitCode rather than process.exit(): exiting inside the top-level await
+// makes Node print "Detected unsettled top-level await" under every error.
 const { cmd, pos, flags } = parse(process.argv.slice(2));
 const args = cmd && argsFor(cmd, pos, flags);
 if (!args) {
   console.log(USAGE);
-  process.exit(cmd && cmd !== 'help' ? 1 : 0);
-}
-try {
-  const result = await request({ id: 1, cmd, args });
-  console.log(typeof result === 'string' ? result : JSON.stringify(result, null, 2));
-} catch (e) {
-  console.error(`browserbear: ${e.message}`);
-  process.exit(1);
+  process.exitCode = cmd && cmd !== 'help' ? 1 : 0;
+} else {
+  try {
+    const result = await request({ id: 1, cmd, args });
+    console.log(typeof result === 'string' ? result : JSON.stringify(result, null, 2));
+  } catch (e) {
+    console.error(`browserbear: ${e.message}`);
+    process.exitCode = 1;
+  }
 }

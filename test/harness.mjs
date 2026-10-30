@@ -2,6 +2,7 @@
 // the extension: onOp answers each { id, op, args } the host passes on.
 import fs from 'node:fs';
 import path from 'node:path';
+import os from 'node:os';
 import { spawn, execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { fileURLToPath } from 'node:url';
@@ -48,4 +49,45 @@ export async function startBear(t, onOp) {
     profiles = await browserbear('profiles').catch(() => '');
   }
   return { browserbear, notices, profiles, home };
+}
+
+export const CHROME = process.env.CHROME_PATH || '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome';
+
+// A real headless Chrome, and a send(method, params, sessionId) for its CDP.
+export async function headlessChrome(t) {
+  const profile = fs.mkdtempSync(path.join(os.tmpdir(), 'browserbear-chrome-'));
+  const chrome = spawn(CHROME, ['--headless', '--remote-debugging-port=0', `--user-data-dir=${profile}`, '--no-first-run', 'about:blank'], { stdio: 'ignore' });
+  t.after(async () => {
+    // Chrome keeps writing to its profile until it has really gone.
+    const gone = new Promise((r) => chrome.once('exit', r));
+    chrome.kill();
+    await gone;
+    fs.rmSync(profile, { recursive: true, force: true, maxRetries: 5 });
+  });
+  const portFile = path.join(profile, 'DevToolsActivePort');
+  // Chrome writes the port, then the path, so wait for both.
+  const read = () => (fs.existsSync(portFile) ? fs.readFileSync(portFile, 'utf8').split('\n') : []);
+  for (let i = 0; i < 100 && !read()[1]; i++) await new Promise((r) => setTimeout(r, 100));
+  const [port, wsPath] = read();
+  const ws = new WebSocket(`ws://127.0.0.1:${port}${wsPath}`);
+  await new Promise((resolve, reject) => {
+    ws.onopen = resolve;
+    ws.onerror = reject;
+  });
+  t.after(() => ws.close());
+  let next = 1;
+  const waiting = new Map();
+  ws.onmessage = ({ data }) => {
+    const msg = JSON.parse(data);
+    const w = waiting.get(msg.id);
+    if (!w) return;
+    waiting.delete(msg.id);
+    msg.error ? w.reject(new Error(msg.error.message)) : w.resolve(msg.result);
+  };
+  return (method, params = {}, sessionId) =>
+    new Promise((resolve, reject) => {
+      const id = next++;
+      waiting.set(id, { resolve, reject });
+      ws.send(JSON.stringify({ id, method, params, sessionId }));
+    });
 }

@@ -7,49 +7,8 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { spawn } from 'node:child_process';
 import { pathToFileURL } from 'node:url';
-import { root, startBear } from './harness.mjs';
-
-const CHROME = process.env.CHROME_PATH || '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome';
-
-async function headlessChrome(t) {
-  const profile = fs.mkdtempSync(path.join(os.tmpdir(), 'browserbear-chrome-'));
-  const chrome = spawn(CHROME, ['--headless', '--remote-debugging-port=0', `--user-data-dir=${profile}`, '--no-first-run', 'about:blank'], { stdio: 'ignore' });
-  t.after(async () => {
-    // Chrome keeps writing to its profile until it has really gone.
-    const gone = new Promise((r) => chrome.once('exit', r));
-    chrome.kill();
-    await gone;
-    fs.rmSync(profile, { recursive: true, force: true, maxRetries: 5 });
-  });
-  const portFile = path.join(profile, 'DevToolsActivePort');
-  // Chrome writes the port, then the path, so wait for both.
-  const read = () => (fs.existsSync(portFile) ? fs.readFileSync(portFile, 'utf8').split('\n') : []);
-  for (let i = 0; i < 100 && !read()[1]; i++) await new Promise((r) => setTimeout(r, 100));
-  const [port, wsPath] = read();
-  const ws = new WebSocket(`ws://127.0.0.1:${port}${wsPath}`);
-  await new Promise((resolve, reject) => {
-    ws.onopen = resolve;
-    ws.onerror = reject;
-  });
-  t.after(() => ws.close());
-  let next = 1;
-  const waiting = new Map();
-  ws.onmessage = ({ data }) => {
-    const msg = JSON.parse(data);
-    const w = waiting.get(msg.id);
-    if (!w) return;
-    waiting.delete(msg.id);
-    msg.error ? w.reject(new Error(msg.error.message)) : w.resolve(msg.result);
-  };
-  return (method, params = {}, sessionId) =>
-    new Promise((resolve, reject) => {
-      const id = next++;
-      waiting.set(id, { resolve, reject });
-      ws.send(JSON.stringify({ id, method, params, sessionId }));
-    });
-}
+import { CHROME, headlessChrome, root, startBear } from './harness.mjs';
 
 test('upload finds the file input behind buttons, labels and selectors', { skip: !fs.existsSync(CHROME) && 'no Chrome' }, async (t) => {
   const send = await headlessChrome(t);
@@ -111,6 +70,12 @@ test('upload finds the file input behind buttons, labels and selectors', { skip:
   // showOpenFilePicker has no input to fill: say so, and the page sees a cancel.
   await assert.rejects(browserbear('upload', '1', ref('Open with the file system API'), talk), /showOpenFilePicker/);
   assert.equal(await output('fsa'), 'AbortError');
+
+  // GOV.UK's photo step: a visually hidden input and a button that opens
+  // nothing by itself, so the nearest input it is.
+  out = await browserbear('upload', '1', ref('Choose your photo'), talk);
+  assert.match(out, /talk\.mp3 set on the file input nearest e\d+/);
+  assert.equal(await output('govuk'), 'talk.mp3 (4)');
 
   await assert.rejects(browserbear('upload', '1', '#nope', talk), /nothing in tab 1 matches the selector "#nope"/);
   await assert.rejects(browserbear('upload', '1', ref('Choose files'), path.join(dir, 'missing.mp3')), /no such file/);

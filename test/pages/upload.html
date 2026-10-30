@@ -35,6 +35,14 @@
   <output></output>
 </section>
 
+<!-- Like GOV.UK's passport photo step: a visually hidden input, and a button
+     that opens nothing by itself (no handler on it here). -->
+<section id="govuk">
+  <input type="file" id="photo" style="position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0)" />
+  <div><button class="btn" type="button">Choose your photo</button></div>
+  <output></output>
+</section>
+
 <script>
   const report = (section) => (e) => {
     section.querySelector('output').textContent = [...e.target.files].map((f) => `${f.name} (${f.size})`).join(', ');
@@ -56,6 +64,9 @@
     made.addEventListener('change', report(detached));
     made.click();
   });
+
+  const govuk = document.querySelector('#govuk');
+  govuk.querySelector('input').addEventListener('change', report(govuk));
 
   const fsa = document.querySelector('#fsa');
   fsa.querySelector('button').addEventListener('click', async () => {

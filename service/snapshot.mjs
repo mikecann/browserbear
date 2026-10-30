@@ -20,7 +20,8 @@ const INTERACTIVE = new Set([
 // covering the page, an alert that just appeared).
 const LANDMARKS = new Set(['dialog', 'alertdialog', 'alert']);
 const FLAGS = ['disabled', 'checked', 'pressed', 'selected', 'expanded', 'focused', 'required', 'invalid'];
-const SECRET_NAME = /pass(word|code)?|secret|token|api.?key|cvc|cvv|card.?number|one.?time|otp/i;
+// Not plain "pass": that masked every "passport" field on GOV.UK (30 Oct).
+const SECRET_NAME = /pass(word|code|phrase)|\bpass\b|secret|token|api.?key|cvc|cvv|card.?number|one.?time|otp/i;
 const MAX_NAME = 80;
 
 // Per-tab ref memory: backendDOMNodeId -> "eN".

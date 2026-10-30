@@ -9,6 +9,7 @@ import fs from 'node:fs';
 import net from 'node:net';
 import os from 'node:os';
 import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { HOME, LOGS, OUT, SOCKET, line, lineReader } from './wire.mjs';
 import { RefMap, compact, diff } from './snapshot.mjs';
 
@@ -173,7 +174,41 @@ async function snapshot(tabId, { full = false } = {}) {
   return `${head}\n${out.text}`;
 }
 
-const settle = () => new Promise((r) => setTimeout(r, SETTLE_MS));
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+const settle = () => sleep(SETTLE_MS);
+
+// A click or key that submits a form starts a navigation that can outlast the
+// settle, and the snapshot then shows the old page as "(no change)" (GOV.UK's
+// Continue buttons, 30 Oct). So the page is marked before acting: still
+// marked "here" afterwards means it stayed; "leaving" (beforeunload fired, the
+// next page hasn't arrived) or no mark (a new document) means wait for the
+// new page to load.
+const MARK = `window.__browserbear = 'here'; addEventListener('beforeunload', () => { window.__browserbear = 'leaving'; }); true`;
+
+async function markPage(tabId) {
+  await evaluate(tabId, MARK).catch(() => {});
+}
+
+async function settleAfterAction(tabId, timeoutMs = 20_000) {
+  await settle();
+  const until = Date.now() + timeoutMs;
+  // A beforeunload with no navigation after it (a download link) would
+  // otherwise wait the full timeout.
+  const leavingUntil = Date.now() + 8_000;
+  let navigated = false;
+  while (Date.now() < until) {
+    // Mid-navigation there may be no context to evaluate in yet.
+    const [mark, ready] = (await evaluate(tabId, `[window.__browserbear ?? null, document.readyState]`).catch(() => null)) || ['leaving'];
+    if (mark === 'here') break;
+    if (mark === null) navigated = true;
+    if (mark === 'leaving' && !navigated && Date.now() > leavingUntil) break;
+    if (mark === null && ready === 'complete') {
+      await settle(); // the new page's own scripts drawing it
+      break;
+    }
+    await sleep(250);
+  }
+}
 
 async function center(tabId, backendNodeId) {
   await cdp(tabId, 'DOM.scrollIntoViewIfNeeded', { backendNodeId }).catch(() => {});
@@ -511,8 +546,10 @@ const commands = {
   snap: ({ tab, full }) => snapshot(tab, { full }),
 
   async click({ tab, ref, script }) {
-    const note = await clickNode(tab, await nodeFor(tab, ref), { script });
-    await settle();
+    const node = await nodeFor(tab, ref);
+    await markPage(tab);
+    const note = await clickNode(tab, node, { script });
+    await settleAfterAction(tab);
     let out = await snapshot(tab);
     // A click that changed nothing visible is often one the page ignored.
     if (out.endsWith('(no change)') && !script) out += `\n(if that click should have done something: browserbear click ${tab} ${ref} --script)`;
@@ -531,14 +568,18 @@ const commands = {
     // insertText fires the same beforeinput/input events as real typing, which
     // rich editors (Discord, Slack, Studio) listen for; setting .value doesn't.
     await cdp(tab, 'Input.insertText', { text });
-    if (submit) await pressKey(tab, 'Enter');
-    await settle();
+    if (submit) {
+      await markPage(tab);
+      await pressKey(tab, 'Enter');
+      await settleAfterAction(tab);
+    } else await settle();
     return snapshot(tab);
   },
 
   async key({ tab, key }) {
+    await markPage(tab);
     await pressKey(tab, key);
-    await settle();
+    await settleAfterAction(tab);
     return snapshot(tab);
   },
 
@@ -553,7 +594,16 @@ const commands = {
 
   // The page's text, for reading rather than acting. Long pages go to a file.
   async read({ tab, max = 4000 }) {
-    const text = await evaluate(tab, 'document.body.innerText');
+    // Straight after a click that navigates, there may be no body yet, or no
+    // page to evaluate in at all (passport.service.gov.uk, 30 Oct): wait for
+    // one rather than fail.
+    await waitForReady(tab, 10_000);
+    let text = null;
+    for (let i = 0; i < 20 && typeof text !== 'string'; i++) {
+      if (i) await sleep(250);
+      text = await evaluate(tab, 'document.body?.innerText ?? null').catch(() => null);
+    }
+    if (typeof text !== 'string') throw new Error(`tab ${tab} has no page to read yet; try again in a moment`);
     if (text.length <= max) return text;
     const file = path.join(OUT, `tab-${tab}-${Date.now()}.txt`);
     fs.writeFileSync(file, text, { mode: 0o600 });
@@ -675,16 +725,32 @@ function onHostMessage(profile, msg) {
   else waiter.reject(new Error(msg.error));
 }
 
+let busy = 0; // client commands in flight, so a restart waits for them
+
+// Just after a (re)start the hosts haven't said hello yet; give them a moment
+// rather than answer "none connected".
+const startedAt = Date.now();
+async function hostsReady() {
+  if (Date.now() - startedAt > 5_000) return;
+  while (!profiles.size && Date.now() - startedAt < 5_000) await sleep(100);
+  // Each profile's host reconnects on its own clock; let the rest catch up.
+  await sleep(Math.max(0, 1_000 - (Date.now() - startedAt)));
+}
+
 async function onClientMessage(conn, msg) {
   const fn = commands[msg.cmd];
+  busy++;
   try {
     if (!fn) throw new Error(`unknown command ${msg.cmd}`);
+    if (msg.cmd !== 'status') await hostsReady();
     const args = { ...(msg.args || {}) };
     // Left as text when it isn't a number: handoff also takes a URL.
     if (/^\d+$/.test(String(args.tab))) args.tab = Number(args.tab);
     conn.write(line({ id: msg.id, ok: true, result: await fn(args) }));
   } catch (e) {
     conn.write(line({ id: msg.id, ok: false, error: e.message }));
+  } finally {
+    busy--;
   }
 }
 
@@ -732,7 +798,39 @@ function listen() {
   server.listen(SOCKET, () => {
     fs.chmodSync(SOCKET, 0o600);
     log('listening', SOCKET, 'pid', process.pid);
+    watch(fs.statSync(SOCKET).ino);
   });
+}
+
+// The service runs until the Mac restarts, so it would go on running the code
+// it started with: an agent hit an upload bug for ten minutes after the fix
+// was on disk (30 Oct). So it bows out when its code changes, once nothing
+// is in flight, and the hosts (and the CLI) start a fresh one. Refs from
+// earlier snapshots go with it; a new snap brings them back. It also goes when
+// its socket does (the tests' throwaway homes), rather than linger unreachable.
+const CODE_DIR = path.dirname(fileURLToPath(import.meta.url));
+function codeStamp() {
+  try {
+    return fs.readdirSync(CODE_DIR).filter((f) => f.endsWith('.mjs')).map((f) => `${f}:${fs.statSync(path.join(CODE_DIR, f)).mtimeMs}`).join(',');
+  } catch {
+    return null; // mid-save; look again next time
+  }
+}
+
+function watch(ino) {
+  const code = codeStamp();
+  setInterval(() => {
+    const now = fs.statSync(SOCKET, { throwIfNoEntry: false });
+    if (now?.ino !== ino) {
+      log('socket gone; exiting');
+      process.exit(0);
+    }
+    const stamp = codeStamp();
+    if (busy || !stamp || stamp === code) return;
+    log('code changed; exiting so a fresh service starts');
+    fs.rmSync(SOCKET, { force: true });
+    process.exit(0);
+  }, 2_000).unref();
 }
 server.on('error', (e) => {
   if (e.code !== 'EADDRINUSE') throw e;

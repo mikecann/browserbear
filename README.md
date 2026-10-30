@@ -31,7 +31,12 @@ browserbear CLI (or Threadbear)
 - Everything that changes a page answers with that diff, so there's no separate look.
 - The extension detaches from a tab 30 s after its last command, so Chrome's "started
   debugging this browser" bar doesn't hang around.
-- All the page logic is in the service; the extension rarely needs to change.
+- All the page logic is in the service; the extension rarely needs to change. The
+  service restarts itself within a couple of seconds of its code changing (once nothing
+  is in flight), so there's nothing to kill after an edit. Refs don't survive that: snap
+  again.
+- A click, key or submit that starts a navigation waits for the next page before it
+  answers, and `read` waits for a page with a body.
 
 ## Install (for now)
 
