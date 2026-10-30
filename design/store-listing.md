@@ -1,7 +1,8 @@
 # Chrome Web Store listing (draft)
 
 Store build 0.1.2 was submitted as Paws on 29 Oct 2026, before the rename. Once
-it's approved, upload a BrowserBear build with this text, and point the privacy and
+it's approved, upload the BrowserBear build (0.2.0 or later: 0.2.0 adds `handoff`,
+which moves an agent's tab into your window) with this text, and point the privacy and
 homepage URLs at browserbear.mikecann.app (paws.mikecann.app serves the same site
 until then).
 
