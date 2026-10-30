@@ -37,6 +37,9 @@ browserbear CLI (or Threadbear)
   again.
 - A click, key or submit that starts a navigation waits for the next page before it
   answers, and `read` waits for a page with a body.
+- Chrome won't let a debugger into a tab holding another extension's frame (a password
+  manager's inline menu), so the extension blanks those frames and gets back in. That
+  needs the `scripting` permission.
 
 ## Install (for now)
 

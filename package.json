@@ -4,7 +4,7 @@
   "description": "Let your local AI agents use your real Chrome profiles",
   "type": "module",
   "bin": { "browserbear": "cli.mjs" },
-  "scripts": { "test": "node --test" },
+  "scripts": { "test": "node --test test/*.test.mjs" },
   "engines": { "node": ">=22" },
   "license": "MIT"
 }

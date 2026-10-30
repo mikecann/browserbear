@@ -186,8 +186,30 @@ const ops = {
   },
 
   async cdp({ tabId, method, params }) {
-    await attach(tabId);
-    return chrome.debugger.sendCommand({ tabId }, method, params || {});
+    try {
+      await attach(tabId);
+      return await chrome.debugger.sendCommand({ tabId }, method, params || {});
+    } catch (e) {
+      const message = String(e?.message);
+      const refused = message.includes('URL of different extension');
+      if (!refused && !message.includes('Detached while handling command')) throw e;
+      // Another extension's frame is in the tab, and Chrome won't let a
+      // debugger near a tab that has one: it cut us off when the frame came
+      // (1Password's menu on focusing an address field, passport.service.gov.uk,
+      // 30 Oct), and refuses to attach again while it's there.
+      const blocking = await blankExtensionFrames(tabId);
+      if (!blocking.length) throw e;
+      const who = `another extension's frame (${blocking.join(', ')}; a password manager's menu, usually)`;
+      // A command Chrome cut off may already have run (typed text, a
+      // click), so it isn't sent again; one that was refused never ran.
+      if (!refused) throw new Error(`${who} appeared mid-command and Chrome detached BrowserBear. It's cleared now; snap to see whether the command ran`);
+      try {
+        await attach(tabId);
+        return await chrome.debugger.sendCommand({ tabId }, method, params || {});
+      } catch (again) {
+        throw new Error(`${who} is in this tab and Chrome won't let BrowserBear in while it's there; clearing it didn't stick (${again?.message})`);
+      }
+    }
   },
 
   async detach({ tabId }) {
@@ -266,6 +288,41 @@ async function attach(tabId) {
   }
   clearTimeout(attached.get(tabId));
   attached.set(tabId, setTimeout(() => detach(tabId), IDLE_DETACH_MS));
+}
+
+// Points other extensions' frames in the tab at about:blank (and hides them),
+// and says whose they were. Blanking rather than removing, so the extension
+// that put one there is less likely to notice and make another. Frames inside
+// closed shadow roots (1Password's) count too: chrome.dom can see into those.
+async function blankExtensionFrames(tabId) {
+  const results = await chrome.scripting
+    .executeScript({
+      target: { tabId, allFrames: true },
+      args: [chrome.runtime.id],
+      func: (self) => {
+        const ids = [];
+        const visit = (root) => {
+          for (const el of root.querySelectorAll('*')) {
+            const shadow = chrome.dom?.openOrClosedShadowRoot?.(el) || el.shadowRoot;
+            if (shadow) visit(shadow);
+            if (!['IFRAME', 'FRAME', 'EMBED', 'OBJECT'].includes(el.tagName)) continue;
+            const m = /^chrome-extension:\/\/([a-p]{32})/.exec(el.src || el.data || '');
+            if (!m || m[1] === self) continue;
+            ids.push(m[1]);
+            el.style.setProperty('display', 'none', 'important');
+            if (el.tagName === 'OBJECT') el.data = 'about:blank';
+            else el.src = 'about:blank';
+          }
+        };
+        visit(document);
+        return ids;
+      },
+    })
+    .catch(() => []);
+  const ids = [...new Set(results.flatMap((r) => r.result || []))];
+  // Give the blanked frames a moment to actually navigate away.
+  if (ids.length) await new Promise((r) => setTimeout(r, 200));
+  return ids;
 }
 
 async function detach(tabId) {

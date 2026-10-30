@@ -9,6 +9,7 @@
   },
   "permissions": [
     "debugger",
+    "scripting",
     "nativeMessaging",
     "tabs",
     "tabGroups",
