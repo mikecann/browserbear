@@ -84,6 +84,17 @@ a sign-in. Given a URL, `handoff` finds the agent tab on that page; Threadbear
 does that when you click a link an agent gave you, so you don't end up with
 two tabs of the same sign-in.
 
+Every tab an agent uses is marked, so you can tell it from yours. The tab's
+title starts with 🐻 and the thread's name, its icon gets a dot (green while
+the agent works in it, amber when it's handed to you, grey while the thread
+has it but isn't using it right now), and a pill in the page says what the
+agent is doing, with Open thread, Stop and ✕ (leave this tab alone). The marks
+come off when the thread finishes its turn without needing you. The CLI passes
+`THREADBEAR_THREAD_ID` along and the service asks Threadbear's `tb` for the
+thread's name and state; outside Threadbear the tab just says "agent". The
+pill steps aside while the agent clicks or takes a screenshot, and agents see
+the page's own title.
+
 Uploads never open Chrome's file picker. Give `upload` the file input itself
 (`snap` lists them as `file-input`, hidden ones too, since sites usually hide the
 real one), the button or label that stands for it, or a CSS selector, and it

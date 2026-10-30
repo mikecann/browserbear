@@ -147,7 +147,9 @@ if (!args) {
   process.exitCode = cmd && cmd !== 'help' ? 1 : 0;
 } else {
   try {
-    const result = await request({ id: 1, cmd, args });
+    // Which Threadbear thread is asking, so the tabs it uses carry its name
+    // (service/marks.mjs). Unset outside Threadbear: the tab says "agent".
+    const result = await request({ id: 1, cmd, args, thread: process.env.THREADBEAR_THREAD_ID || undefined });
     console.log(typeof result === 'string' ? result : JSON.stringify(result, null, 2));
   } catch (e) {
     console.error(`browserbear: ${e.message}`);

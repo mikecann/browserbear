@@ -1,0 +1,21 @@
+<link rel=stylesheet href=base.css><style>
+.glow{position:absolute;inset:88px 0 0 0;box-shadow:inset 0 0 0 3px #4ade80,inset 0 0 28px #4ade8055;pointer-events:none;z-index:2}
+.pill{position:absolute;right:24px;top:110px;background:#111827;color:#e5e7eb;border-radius:999px;padding:8px 8px 8px 14px;font-size:13px;display:flex;align-items:center;gap:10px;box-shadow:0 6px 20px #0004;z-index:3}
+.pill .d{width:8px;height:8px;border-radius:50%;background:#4ade80;box-shadow:0 0 0 4px #4ade8033}
+.pill button{background:#374151;color:#fff;border:0;border-radius:999px;padding:5px 10px;font-size:12px}
+.pill2{top:auto;bottom:110px;right:24px;background:#fff7e6;color:#7c4a03;border:1px solid #fbbf24}.pill2 .d{background:#fbbf24;box-shadow:none}.pill2 button{background:#fbbf24;color:#3b2500}
+.mini{position:absolute;left:640px;top:240px;width:560px;height:260px;background:#fff;border-radius:10px;border:1px solid #ddd;padding:16px;font-size:12px;color:#555}
+.target{outline:2px dashed #4ade80;outline-offset:3px;border-radius:6px;display:inline-block;padding:6px 14px;background:#1d9bf0;color:#fff;font-weight:600;margin-top:12px}
+</style>
+<div class=strip><div class=dots><i style=background:#ff5f57></i><i style=background:#febc2e></i><i style=background:#28c840></i></div>
+<div class=tab><div class=fav style=background:#ea4335>M</div>Inbox - Gmail</div>
+<div class="tab on"><div class=fav style=background:#000>𝕏</div>Home / X</div>
+<div class=tab><div class=fav style=background:#0a66c2>in</div>Feed | LinkedIn</div>
+</div>
+<div class=bar><span>←</span><span>→</span><span>↻</span><div class=url>x.com/compose/post</div></div>
+<div class=page><div class=fake><h1>Compose post</h1><div class=row></div><div class=row style=width:70%></div><div class=target>Post</div></div>
+<div style="position:absolute;left:40px;top:220px;width:420px;font-size:12px;color:#888">↑ the thing the agent is about to click gets a dashed outline</div></div>
+<div class=glow></div>
+<div class=pill><i class=d></i><span><b>🐻 poddle</b> is using this tab · clicking "Post"</span><button>Open thread</button><button>Stop</button></div>
+<div class="pill pill2" style="display:none"></div>
+<div class=cap style="z-index:4"><b>B · Mark the page.</b> While an agent has the tab, a thin green glow sits around the page, and a pill names the thread and what it's doing right now, with <i>Open thread</i> and <i>Stop</i>. It turns amber when it's waiting for you and drops to a small "🐻 poddle · idle" chip in the corner when the agent goes quiet. Very clear once you're on the tab, but the tab strip looks normal, and it's drawn in the page, so BrowserBear hides it from its own snaps and screenshots.</div>

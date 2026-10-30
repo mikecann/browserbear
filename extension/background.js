@@ -6,7 +6,8 @@
 //  - says hello with the profile's signed-in account, so agents can ask for
 //    "Work" instead of a number that changes between connects,
 //  - runs a handful of ops: list/open/close tabs, raw CDP through
-//    chrome.debugger, downloads.
+//    chrome.debugger, downloads,
+//  - draws the marks on agents' tabs (the thread's name and a pill).
 
 const HOST = 'dev.browserbear.host';
 // Detach the debugger this long after a tab's last command, so Chrome's
@@ -81,7 +82,8 @@ const tabInfo = (t) => ({
   tabId: t.id,
   windowId: t.windowId,
   url: t.url || t.pendingUrl || '',
-  title: t.title || '',
+  // Without the mark's "🐻 name · ", so agents see the page's own title.
+  title: (t.title || '').replace(MARK_PREFIX, ''),
   active: t.active,
   groupId: t.groupId,
   status: t.status,
@@ -190,6 +192,7 @@ const ops = {
   },
 
   async cdp({ tabId, method, params }) {
+    if (COVERED.test(method)) await hideMark(tabId);
     try {
       await attach(tabId);
       return await chrome.debugger.sendCommand({ tabId }, method, params || {});
@@ -213,7 +216,21 @@ const ops = {
       } catch (again) {
         throw new Error(`${who} is in this tab and Chrome won't let BrowserBear in while it's there; clearing it didn't stick (${again?.message})`);
       }
+    } finally {
+      if (COVERED.test(method)) showMarkSoon(tabId);
     }
+  },
+
+  // Draws (or, with no mark, takes off) the marks on an agent's tab; the
+  // service decides what they say (service/marks.mjs).
+  async mark({ tabId, mark }) {
+    await chrome.tabs.get(tabId); // "No tab with id" tells the service it's gone
+    const all = await markStore();
+    if (mark) all[tabId] = mark;
+    else delete all[tabId];
+    await chrome.storage.session.set({ marks: all });
+    await paint(tabId, mark);
+    return true;
   },
 
   async detach({ tabId }) {
@@ -228,6 +245,223 @@ const ops = {
     return waitForDownload(id);
   },
 };
+
+// ---- Marks on agents' tabs ----
+// The tab's title becomes "🐻 thread · page title" and its icon gets a dot,
+// so you can tell agents' tabs apart in the tab strip; in the page a pill
+// says what the agent is doing, with Open thread, Stop and ✕ (leave this
+// tab alone). Kept in session storage so a tab that navigates gets them
+// back, even after this worker has slept.
+const MARK_PREFIX = /^🐻 [^·]{1,40} · /;
+const DOTS = { working: '#22c55e', yours: '#f59e0b', idle: '#9ca3af' };
+
+let marks = null;
+async function markStore() {
+  marks ||= (await chrome.storage.session.get('marks')).marks || {};
+  return marks;
+}
+
+async function paint(tabId, mark) {
+  const icon = mark ? await badgedIcon(tabId, mark.state).catch(() => null) : null;
+  // Pages extensions can't script (the Web Store, chrome://) go unmarked.
+  await chrome.scripting.executeScript({ target: { tabId }, func: drawMark, args: [mark, icon] }).catch(() => {});
+}
+
+// A page that navigates loses what was drawn on it.
+chrome.tabs.onUpdated.addListener(async (tabId, change) => {
+  if (change.status !== 'complete') return;
+  const mark = (await markStore())[tabId];
+  if (mark) await paint(tabId, mark);
+});
+
+chrome.tabs.onRemoved.addListener(async (tabId) => {
+  const all = await markStore();
+  if (!(tabId in all)) return;
+  delete all[tabId];
+  await chrome.storage.session.set({ marks: all });
+});
+
+// The pill's buttons.
+chrome.runtime.onMessage.addListener((msg, sender) => {
+  if (sender.id !== chrome.runtime.id || msg?.type !== 'mark-action' || !sender.tab) return;
+  const tab = sender.tab;
+  if (msg.action === 'open' && msg.url) chrome.tabs.create({ url: msg.url, windowId: tab.windowId, index: tab.index + 1 });
+  if (msg.action === 'release') ops.mark({ tabId: tab.id, mark: null }).catch(() => {});
+  if (msg.action === 'stop' || msg.action === 'release') post({ type: 'event', event: 'mark', action: msg.action, tabId: tab.id });
+});
+
+// The pill is in the page, so it would catch an agent's real clicks (and
+// the check for what's on top of the target) and be in its screenshots: it
+// steps aside for those commands and comes back just after.
+const COVERED = /^(Input\.|DOM\.getNodeForLocation$|Page\.captureScreenshot$)/;
+const showTimers = new Map();
+
+async function hideMark(tabId) {
+  if (!(tabId in (await markStore()))) return;
+  const wasShowing = !showTimers.has(tabId);
+  clearTimeout(showTimers.get(tabId));
+  showTimers.set(tabId, null);
+  if (wasShowing) await setMarkHidden(tabId, true);
+}
+
+function showMarkSoon(tabId) {
+  if (!showTimers.has(tabId)) return;
+  clearTimeout(showTimers.get(tabId));
+  showTimers.set(tabId, setTimeout(() => {
+    showTimers.delete(tabId);
+    setMarkHidden(tabId, false);
+  }, 600));
+}
+
+function setMarkHidden(tabId, hidden) {
+  return chrome.scripting
+    .executeScript({ target: { tabId }, func: (h) => window.__browserbearMark?.hide(h), args: [hidden] })
+    .catch(() => {});
+}
+
+// The page's own icon with the state's dot on it, as a data URL. Fetched
+// here rather than in the page, where another site's icon can't be drawn
+// onto a canvas and read back.
+const icons = new Map(); // "href|state" -> data URL
+async function badgedIcon(tabId, state) {
+  const [{ result: href } = {}] = await chrome.scripting.executeScript({ target: { tabId }, func: siteIcon });
+  const key = `${href}|${state}`;
+  if (icons.has(key)) return icons.get(key);
+  let bitmap = null;
+  try {
+    const res = await fetch(href);
+    if (res.ok) bitmap = await createImageBitmap(await res.blob());
+  } catch {} // no icon, or an SVG, which a worker can't decode
+  bitmap ||= await createImageBitmap(await (await fetch(chrome.runtime.getURL('icons/icon-32.png'))).blob());
+  const canvas = new OffscreenCanvas(32, 32);
+  const g = canvas.getContext('2d');
+  g.drawImage(bitmap, 0, 0, 32, 32);
+  g.beginPath();
+  g.arc(24, 24, 8, 0, Math.PI * 2);
+  g.fillStyle = '#fff';
+  g.fill();
+  g.beginPath();
+  g.arc(24, 24, 6, 0, Math.PI * 2);
+  g.fillStyle = DOTS[state] || DOTS.idle;
+  g.fill();
+  const bytes = new Uint8Array(await (await canvas.convertToBlob({ type: 'image/png' })).arrayBuffer());
+  let bin = '';
+  for (const b of bytes) bin += String.fromCharCode(b);
+  const url = `data:image/png;base64,${btoa(bin)}`;
+  icons.set(key, url);
+  return url;
+}
+
+// Runs in the page. The site's icon, before the mark replaced it.
+function siteIcon() {
+  const saved = window.__browserbearMark?.siteIcon;
+  const link = document.querySelector('link[rel~="icon" i]:not([data-browserbear]), link[rel="browserbear-icon"]');
+  return saved || link?.href || new URL('/favicon.ico', location.href).href;
+}
+
+// Runs in the page (the extension's isolated world, which shares the DOM):
+// draws the mark, keeps the title and icon ours while the site changes its
+// own, and with no mark puts everything back.
+function drawMark(mark, icon) {
+  const PREFIX = /^🐻 [^·]{1,40} · /;
+  let m = window.__browserbearMark;
+  if (!m && !mark) return;
+  if (!m) {
+    // Leftovers from before the extension reloaded, whose scripts can't be
+    // reached any more (and stop themselves: see enforce).
+    document.querySelectorAll('browserbear-mark, link[data-browserbear]').forEach((el) => el.remove());
+    m = window.__browserbearMark = { siteTitle: document.title.replace(PREFIX, ''), saved: [], hidden: false };
+    for (const l of document.querySelectorAll('link[rel="browserbear-icon"]')) m.saved.push([l, 'icon']);
+
+    m.host = document.createElement('browserbear-mark');
+    // Out of the accessibility tree, so agents' snapshots don't see it.
+    m.host.setAttribute('aria-hidden', 'true');
+    m.host.style.cssText = 'all:initial;position:fixed;inset:0;pointer-events:none;z-index:2147483647';
+    const root = m.host.attachShadow({ mode: 'closed' });
+    root.innerHTML = `<style>
+      :host{all:initial}
+      .glow{position:fixed;inset:0;pointer-events:none;transition:box-shadow .3s}
+      .pill{position:fixed;top:12px;right:12px;display:flex;align-items:center;gap:8px;max-width:min(560px,calc(100vw - 24px));
+        padding:6px 6px 6px 12px;border-radius:999px;background:#111827;color:#e5e7eb;pointer-events:auto;
+        font:13px/1.2 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;box-shadow:0 6px 20px rgba(0,0,0,.25);opacity:.96}
+      .dot{width:8px;height:8px;border-radius:50%;flex:none}
+      .working .dot{animation:pulse 1.4s ease-in-out infinite}
+      @keyframes pulse{50%{box-shadow:0 0 0 5px rgba(34,197,94,.25)}}
+      .text{white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+      .text b{color:#fff;font-weight:600}
+      button{all:unset;cursor:pointer;padding:4px 10px;border-radius:999px;background:#374151;color:#fff;font-size:12px;white-space:nowrap}
+      button:hover{background:#4b5563}
+      .x{padding:4px 7px;background:none;color:#9ca3af}
+      .idle{padding-top:4px;padding-bottom:4px;opacity:.85}
+    </style><div class=glow></div><div class=pill><i class=dot></i><span class=text></span>
+      <button class=open>Open thread</button><button class=stop>Stop</button><button class=x title="Leave this tab alone">✕</button></div>`;
+    const $ = (sel) => root.querySelector(sel);
+    m.parts = { glow: $('.glow'), pill: $('.pill'), dot: $('.dot'), text: $('.text'), open: $('.open'), stop: $('.stop') };
+    const send = (action) => chrome.runtime.sendMessage({ type: 'mark-action', action, url: m.mark?.url }).catch(() => {});
+    $('.open').onclick = () => send('open');
+    $('.stop').onclick = () => send('stop');
+    $('.x').onclick = () => send('release');
+
+    m.hide = (hidden) => {
+      m.hidden = hidden;
+      m.host.style.display = hidden ? 'none' : '';
+    };
+    // Sites change their title and icon (Gmail's unread count): the page's
+    // new one is kept for later and ours put back.
+    m.enforce = () => {
+      // A script from before the extension reloaded: it can't reach the
+      // extension any more, so it bows out rather than fight the new one.
+      if (!chrome.runtime?.id) return m.observer.disconnect();
+      if (!m.mark) return;
+      if (!PREFIX.test(document.title)) m.siteTitle = document.title;
+      const title = `🐻 ${m.mark.name} · ${m.siteTitle}`;
+      if (document.title !== title) document.title = title;
+      for (const l of document.querySelectorAll('link[rel~="icon" i]:not([data-browserbear])')) {
+        m.saved.push([l, l.rel]);
+        m.siteIcon = l.href;
+        l.rel = 'browserbear-icon';
+      }
+      if (m.icon && !m.iconLink?.isConnected) {
+        m.iconLink = Object.assign(document.createElement('link'), { rel: 'icon', href: m.icon });
+        m.iconLink.dataset.browserbear = '';
+        (document.head || document.documentElement).append(m.iconLink);
+      }
+      if (!m.host.isConnected) document.documentElement.append(m.host);
+    };
+    m.observer = new MutationObserver(() => m.enforce());
+  }
+
+  if (!mark) {
+    m.observer.disconnect();
+    m.host.remove();
+    m.iconLink?.remove();
+    for (const [l, rel] of m.saved) l.rel = rel;
+    if (PREFIX.test(document.title)) document.title = m.siteTitle;
+    delete window.__browserbearMark;
+    return;
+  }
+
+  m.mark = mark;
+  m.icon = icon;
+  if (m.iconLink && m.iconLink.href !== icon) {
+    m.iconLink.remove();
+    m.iconLink = null;
+  }
+  const colour = { working: '#22c55e', yours: '#f59e0b', idle: '#9ca3af' }[mark.state] || '#9ca3af';
+  const p = m.parts;
+  p.pill.className = `pill ${mark.state}`;
+  p.dot.style.background = colour;
+  p.text.textContent = '';
+  p.text.append('🐻 ', Object.assign(document.createElement('b'), { textContent: mark.name }), ` · ${mark.action}`);
+  p.open.style.display = mark.url ? '' : 'none';
+  p.stop.style.display = mark.stop ? '' : 'none';
+  // The glow only while it's busy or waiting on you; an idle tab just keeps the small pill.
+  p.glow.style.boxShadow = mark.state === 'idle' ? 'none' : `inset 0 0 0 3px ${colour}, inset 0 0 24px ${colour}55`;
+  m.observer.disconnect();
+  m.enforce();
+  m.observer.observe(document.documentElement, { childList: true });
+  if (document.head) m.observer.observe(document.head, { childList: true, subtree: true, characterData: true, attributes: true, attributeFilter: ['rel', 'href'] });
+}
 
 async function bearWindow() {
   const { bearWindow: id } = await chrome.storage.session.get('bearWindow');

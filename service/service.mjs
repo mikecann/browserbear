@@ -11,6 +11,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { HOME, LOGS, OUT, SOCKET, line, lineReader } from './wire.mjs';
+import { createMarks } from './marks.mjs';
 import { RefMap, compact, diff, sameApartFromFocus } from './snapshot.mjs';
 
 fs.mkdirSync(LOGS, { recursive: true, mode: 0o700 });
@@ -81,6 +82,43 @@ async function ownerOf(tabId) {
   const found = profiles.get(tabOwner.get(tabId));
   if (!found) throw new Error(`no tab ${tabId} in any connected profile (browserbear tabs lists them)`);
   return found;
+}
+
+const marks = createMarks({
+  send: async (tabId, mark) => call(await ownerOf(tabId), 'mark', { tabId, mark }, 5_000),
+  log,
+});
+
+// What the pill in an agent's tab says it's doing, per command.
+const USES = {
+  snap: () => 'looking at the page',
+  click: ({ tab, ref }) => `clicking ${labelOf(tab, ref)}`,
+  type: () => 'typing',
+  key: ({ key }) => `pressing ${key}`,
+  goto: ({ url }) => `going to ${hostOf(url)}`,
+  read: () => 'reading the page',
+  shot: () => 'taking a screenshot',
+  eval: () => 'running a script',
+  cdp: () => 'working',
+  upload: () => 'uploading a file',
+  download: () => 'downloading a file',
+  dialog: () => 'answering a dialog',
+  show: () => 'looking at the page',
+};
+
+// "Post" for e12 when the last snapshot had `e12 button "Post"`.
+function labelOf(tabId, ref) {
+  const line = tabState.get(tabId)?.last?.find((l) => l.startsWith(`${ref} `));
+  const name = line && /"(.*)"/.exec(line)?.[1];
+  return name ? `"${name.length > 40 ? `${name.slice(0, 39)}…` : name}"` : 'something';
+}
+
+function hostOf(url) {
+  try {
+    return new URL(url).host || url;
+  } catch {
+    return url;
+  }
 }
 
 const state = (tabId) => {
@@ -579,15 +617,16 @@ const commands = {
       out.push(`${describe(p)}:`);
       for (const t of await call(p, 'tabs')) {
         remember(p.instance, t);
-        out.push(`  ${t.tabId}${t.active ? '*' : ' '} ${t.title.slice(0, 60)} <${t.url.slice(0, 100)}>`);
+        out.push(`  ${t.tabId}${t.active ? '*' : ' '} ${t.title.slice(0, 60)} <${t.url.slice(0, 100)}>${marks.label(t.tabId)}`);
       }
     }
     return out.join('\n');
   },
 
-  async open({ profile, url }) {
+  async open({ profile, url, thread }) {
     const p = findProfile(profile);
     const tab = remember(p.instance, await call(p, 'open', { url }, 40_000));
+    marks.used(tab.tabId, thread, `opening ${hostOf(url)}`);
     bearTabs.add(tab.tabId);
     sent(tab.tabId, url);
     const snap = await snapshot(tab.tabId);
@@ -595,7 +634,7 @@ const commands = {
   },
 
   // Find one of Mike's own tabs by a bit of its URL or title.
-  async claim({ match, profile }) {
+  async claim({ match, profile, thread }) {
     const list = profile ? [findProfile(profile)] : [...profiles.values()];
     const hits = [];
     for (const p of list) {
@@ -608,6 +647,7 @@ const commands = {
     if (hits.length > 1) {
       return `several tabs match; pick one by id:\n${hits.map(({ p, t }) => `  ${t.tabId} [${describe(p)}] ${t.title.slice(0, 60)} <${t.url.slice(0, 100)}>`).join('\n')}`;
     }
+    marks.used(hits[0].t.tabId, thread, 'looking at the page');
     return snapshot(hits[0].t.tabId);
   },
 
@@ -737,7 +777,7 @@ const commands = {
   // Given a URL rather than an id, it finds the agent tab already on that
   // page (Threadbear does this for the link buttons on an agent's asks, so
   // you don't get a second tab of the same page).
-  async handoff({ tab }) {
+  async handoff({ tab, thread }) {
     const tabId = typeof tab === 'number' ? tab : await agentTabFor(tab);
     const p = await ownerOf(tabId);
     const t = await call(p, 'handoff', { tabId }).catch((e) => {
@@ -746,7 +786,8 @@ const commands = {
       if (typeof tab === 'string' && /no tab with id/i.test(e.message) && sentTo.delete(tabId)) return null;
       throw e;
     });
-    if (!t) return commands.handoff({ tab });
+    if (!t) return commands.handoff({ tab, thread });
+    marks.handedOff(tabId, thread);
     // It's the user's now: no more pulling it forward for real clicks.
     bearTabs.delete(tabId);
     return `tab ${tabId} is in front of the user, in their own Chrome window: ${t.title} <${t.url}>\nSay so when you ask them; a link to the same page as well would open a second tab.`;
@@ -772,6 +813,7 @@ const commands = {
     const p = await ownerOf(tab);
     await call(p, 'close', { tabId: tab });
     tabState.delete(tab);
+    marks.closed(tab);
     tabOwner.delete(tab);
     bearTabs.delete(tab);
     sentTo.delete(tab);
@@ -794,6 +836,9 @@ function onHostMessage(profile, msg) {
     }
     if (msg.event === 'dialogClosed') state(msg.tabId).dialog = null; // you answered it yourself
     if (msg.event === 'detached') log('detached', msg.tabId, msg.reason);
+    // The buttons on the pill in an agent's tab.
+    if (msg.event === 'mark' && msg.action === 'stop') marks.stop(msg.tabId);
+    if (msg.event === 'mark' && msg.action === 'release') marks.release(msg.tabId);
     return;
   }
   const waiter = profile.pending.get(msg.id);
@@ -818,18 +863,24 @@ async function hostsReady() {
 
 async function onClientMessage(conn, msg) {
   const fn = commands[msg.cmd];
+  let using = null; // the tab this command works in, for its marks
   busy++;
   try {
     if (!fn) throw new Error(`unknown command ${msg.cmd}`);
     if (msg.cmd !== 'status') await hostsReady();
-    const args = { ...(msg.args || {}) };
+    const args = { ...(msg.args || {}), thread: msg.thread };
     // Left as text when it isn't a number: handoff also takes a URL.
     if (/^\d+$/.test(String(args.tab))) args.tab = Number(args.tab);
+    if (typeof args.tab === 'number' && USES[msg.cmd]) {
+      using = args.tab;
+      marks.begin(using, msg.thread, USES[msg.cmd](args));
+    }
     conn.write(line({ id: msg.id, ok: true, result: await fn(args) }));
   } catch (e) {
     conn.write(line({ id: msg.id, ok: false, error: e.message }));
   } finally {
     busy--;
+    if (using !== null) marks.end(using);
   }
 }
 
@@ -848,6 +899,7 @@ const server = net.createServer((conn) => {
         profile = { instance: msg.instance, email: msg.email, name: known.name, dir: known.dir, conn, pending: new Map() };
         profiles.set(msg.instance, profile);
         log('hello from', describe(profile), msg.version);
+        marks.resend();
         // The name agents will find this profile by, for the setup page.
         // Older extensions answer it with an "unknown op" error that has no
         // id, which onHostMessage drops.

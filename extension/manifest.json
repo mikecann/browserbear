@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "BrowserBear",
-  "version": "0.2.1",
+  "version": "0.3.0",
   "description": "Lets your local AI agents use this Chrome profile, through the BrowserBear service on your Mac.",
   "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAtUJ4gV0Woviu2XnpZZfVvDo9rCzaWCD0JNnkNdw/r8WKhl2abYBvzHmgfPG29ZsKK3ahgKz8/sWN6ibEvLpqWhez2dL48azThCbBlllDU+ygrMxhCS+Apd0yFPPkjLiNlLtaHByo/ebpDwX0tzNNDZMCUOpnHfr8szFlt22IxjSwrUvbgaISpkEURi7ZiMskF1xKwd3Iqk0X72loDKIVFt0ROMGWR3nEHk6ASv5wNSF1vaYW8Bc6+fDmSJMCrVTmcy6HyYwSqiJjbvIGu4AfMm8WrFoGfxhJ97UaTQmE77MmKHWbqbahxYeGIztHRPrYNqUGHIGSH0brgsCh5kD8wwIDAQAB",
   "background": {

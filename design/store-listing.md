@@ -27,7 +27,8 @@ nothing.
 
 - Agents ask for a profile by its name ("Work") instead of guessing, so they don't end
   up in the wrong Google account.
-- Agent tabs open in a window of their own, away from yours.
+- Agent tabs open in a window of their own, away from yours, and every tab an agent uses
+  is marked with its job's name and whether it's working or waiting for you.
 - While an agent is working, Chrome shows "BrowserBear started debugging this browser". That's
   Chrome's own notice; BrowserBear stops 30 seconds after the last command and the bar goes.
 - Nothing leaves your Mac. The extension only talks to the BrowserBear service on the same

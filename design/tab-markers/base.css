@@ -1,0 +1,13 @@
+*{box-sizing:border-box;margin:0;font-family:-apple-system,BlinkMacSystemFont,"SF Pro Text",sans-serif}
+body{background:#1e1f22;width:1280px;height:760px;color:#e3e3e3;overflow:hidden}
+.strip{display:flex;align-items:flex-end;gap:2px;height:44px;padding:0 8px 0 90px;background:#1e1f22;position:relative}
+.dots{position:absolute;left:14px;top:16px;display:flex;gap:8px}.dots i{width:12px;height:12px;border-radius:50%;display:block}
+.tab{display:flex;align-items:center;gap:8px;height:36px;padding:0 12px;width:200px;border-radius:10px 10px 0 0;font-size:12.5px;color:#c4c7c5;white-space:nowrap;overflow:hidden;position:relative}
+.tab.on{background:#35363a;color:#fff}
+.fav{width:16px;height:16px;border-radius:4px;flex:none;position:relative;display:grid;place-items:center;font-size:10px;font-weight:700;color:#fff}
+.bar{height:44px;background:#35363a;display:flex;align-items:center;gap:14px;padding:0 14px}
+.url{flex:1;height:32px;border-radius:16px;background:#202124;display:flex;align-items:center;padding:0 16px;font-size:14px;color:#c4c7c5}
+.page{position:absolute;top:88px;left:0;right:0;bottom:0;background:#f6f8fc;color:#202124}
+.cap{position:absolute;bottom:0;left:0;right:0;background:#111;color:#ddd;font-size:15px;padding:14px 20px;line-height:1.45}
+.cap b{color:#fff}
+.fake{padding:28px 40px}.fake h1{font-size:22px;font-weight:500;margin-bottom:18px}.row{height:14px;background:#dfe3eb;border-radius:7px;margin:12px 0}
