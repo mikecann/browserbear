@@ -26,6 +26,17 @@ test('compact keeps headings and controls, masks secrets, walks through ignored 
   ]);
 });
 
+test('file inputs are listed whether or not the tree has them', () => {
+  // 70 is in the tree (as its checkbox, here); 99 is hidden, so it isn't.
+  const files = new Map([
+    [70, { id: 'kids', accept: '' }],
+    [99, { id: 'enhance-file-upload', label: '', accept: '.mp3,.wav', multiple: true }],
+  ]);
+  const lines = compact(page(), new RefMap(), files);
+  assert.equal(lines[4], 'e4 file-input "Made for kids" #kids');
+  assert.equal(lines.at(-1), 'e5 file-input #enhance-file-upload accept=".mp3,.wav" [multiple, hidden]');
+});
+
 test('refs stay on the same node across snapshots', () => {
   const refs = new RefMap();
   compact(page(), refs);

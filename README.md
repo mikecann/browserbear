@@ -61,6 +61,7 @@ browserbear claim studio.youtube.com          # one of your open tabs, and what'
 browserbear open https://example.com --profile Work --group "My thread"
 browserbear click 1234 e12
 browserbear type 1234 e7 "Hello" --submit
+browserbear upload 1234 e12 ~/talk.mp3         # e12 can be the "Choose files" button
 browserbear read 1234                          # page text; long pages go to a file
 browserbear shot 1234                          # prints the PNG path
 browserbear handoff 1234                       # your turn: the tab moves into your window
@@ -74,6 +75,13 @@ screen you aren't looking at. `open` and `goto` say so when a page looks like
 a sign-in. Given a URL, `handoff` finds the agent tab on that page; Threadbear
 does that when you click a link an agent gave you, so you don't end up with
 two tabs of the same sign-in.
+
+Uploads never open Chrome's file picker. Give `upload` the file input itself
+(`snap` lists them as `file-input`, hidden ones too, since sites usually hide the
+real one), the button or label that stands for it, or a CSS selector, and it
+finds the input and sets the files there. A button whose input only appears when
+it's clicked gets clicked, with the picker caught before it opens. Pages that use
+`showOpenFilePicker` instead of an input can't be filled this way.
 
 `browserbear help` lists everything.
 

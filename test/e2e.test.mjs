@@ -1,90 +1,49 @@
-// The whole chain without Chrome: this test plays the extension, talking
-// native messaging to the real host, which starts the real service, which the
-// real CLI talks to.
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import fs from 'node:fs';
-import os from 'node:os';
-import path from 'node:path';
-import { spawn, execFile } from 'node:child_process';
-import { promisify } from 'node:util';
-import { fileURLToPath } from 'node:url';
-import { encodeNative, nativeReader } from '../service/wire.mjs';
-
-const root = path.join(path.dirname(fileURLToPath(import.meta.url)), '..');
-const run = promisify(execFile);
+import { startBear } from './harness.mjs';
 
 test('CLI -> service -> host -> fake extension and back', async (t) => {
-  // Short path: Unix socket paths are capped at 104 bytes on macOS.
-  const home = fs.mkdtempSync(path.join('/tmp', 'browserbear-'));
-  const localState = path.join(home, 'Local State');
-  fs.writeFileSync(localState, JSON.stringify({ profile: { info_cache: { 'Profile 2': { name: 'Work', user_name: 'me@example.com' } } } }));
-  const env = { ...process.env, BROWSERBEAR_HOME: home, BROWSERBEAR_CHROME_LOCAL_STATE: localState };
-
-  const host = spawn(process.execPath, [path.join(root, 'host', 'browserbear-host.mjs'), 'chrome-extension://x/'], { env });
   const cdpCalls = [];
-  const notices = []; // { type } messages from the host and service, for the setup page
   const handedOff = [];
   let topNode = 99; // what DOM.getNodeForLocation says is at the click point
-  const reply = (msg) => host.stdin.write(encodeNative(msg));
-  host.stdout.on(
-    'data',
-    nativeReader((msg) => {
-      if (msg.type) return notices.push(msg);
-      const { id, op, args } = msg;
-      if (op === 'tabs') {
-        return reply({
-          id,
-          ok: true,
-          result: [
-            { tabId: 7, url: 'https://studio.youtube.com/', title: 'Studio', active: true },
-            // An agent's tab, in BrowserBear's window: an id the handoff tests look for.
-            { tabId: 8, url: 'https://login.qantas.com/signin', title: 'Log in', active: true, agent: true },
+  const { browserbear, notices, profiles } = await startBear(t, ({ op, args }) => {
+    if (op === 'tabs') {
+      return [
+        { tabId: 7, url: 'https://studio.youtube.com/', title: 'Studio', active: true },
+        // An agent's tab, in BrowserBear's window: an id the handoff tests look for.
+        { tabId: 8, url: 'https://login.qantas.com/signin', title: 'Log in', active: true, agent: true },
+      ];
+    }
+    // Opening the bookings page lands on the sign-in page (tab 8).
+    if (op === 'open') return { tabId: 8, url: 'https://login.qantas.com/signin', title: 'Log in', active: true };
+    if (op === 'handoff') {
+      handedOff.push(args.tabId);
+      return { tabId: args.tabId, url: 'https://login.qantas.com/signin', title: 'Log in' };
+    }
+    if (op === 'cdp') {
+      cdpCalls.push(args.method);
+      const results = {
+        'Accessibility.getFullAXTree': {
+          nodes: [
+            { nodeId: '1', role: { value: 'RootWebArea' }, childIds: ['2'] },
+            { nodeId: '2', parentId: '1', role: { value: 'button' }, name: { value: 'Upload' }, backendDOMNodeId: 99 },
           ],
-        });
-      }
-      // Opening the bookings page lands on the sign-in page (tab 8).
-      if (op === 'open') return reply({ id, ok: true, result: { tabId: 8, url: 'https://login.qantas.com/signin', title: 'Log in', active: true } });
-      if (op === 'handoff') {
-        handedOff.push(args.tabId);
-        return reply({ id, ok: true, result: { tabId: args.tabId, url: 'https://login.qantas.com/signin', title: 'Log in' } });
-      }
-      if (op === 'cdp') {
-        cdpCalls.push(args.method);
-        const results = {
-          'Accessibility.getFullAXTree': {
-            nodes: [
-              { nodeId: '1', role: { value: 'RootWebArea' }, childIds: ['2'] },
-              { nodeId: '2', parentId: '1', role: { value: 'button' }, name: { value: 'Upload' }, backendDOMNodeId: 99 },
-            ],
-          },
-          'DOM.getContentQuads': { quads: [[0, 0, 10, 0, 10, 10, 0, 10]] },
-          'DOM.getNodeForLocation': { backendNodeId: topNode },
-          'DOM.resolveNode': { object: { objectId: `obj-${args.params?.backendNodeId}` } },
-          // Only asked when something else is on top: it names the covering element.
-          'Runtime.callFunctionOn': { result: { value: 'div#overlay' } },
-        };
-        return reply({ id, ok: true, result: results[args.method] || {} });
-      }
-      reply({ id, ok: false, error: `unexpected op ${op}` });
-    }),
-  );
-  reply({ type: 'hello', instance: 'inst-1', email: 'me@example.com', version: 'test' });
-
-  const browserbear = (...a) => run(process.execPath, [path.join(root, 'cli.mjs'), ...a], { env }).then((r) => r.stdout.trim());
-  t.after(async () => {
-    const status = JSON.parse(await browserbear('status').catch(() => '{}'));
-    host.kill();
-    if (status.pid) process.kill(status.pid);
-    fs.rmSync(home, { recursive: true, force: true });
+        },
+        // One hidden file input, which isn't in the tree above.
+        'DOM.getDocument': { root: { nodeId: 1 } },
+        'DOM.querySelectorAll': { nodeIds: [5] },
+        'DOM.describeNode': { node: { backendNodeId: 77, attributes: ['id', 'video-file', 'accept', 'video/*', 'style', 'display:none'] } },
+        'DOM.getContentQuads': { quads: [[0, 0, 10, 0, 10, 10, 0, 10]] },
+        'DOM.getNodeForLocation': { backendNodeId: topNode },
+        'DOM.resolveNode': { object: { objectId: `obj-${args.params?.backendNodeId}` } },
+        // Only asked when something else is on top: it names the covering element.
+        'Runtime.callFunctionOn': { result: { value: 'div#overlay' } },
+      };
+      return results[args.method] || {};
+    }
+    throw new Error(`unexpected op ${op}`);
   });
 
-  // The host starts the service; wait for the profile to show up.
-  let profiles = '';
-  for (let i = 0; i < 40 && !profiles.includes('●'); i++) {
-    await new Promise((r) => setTimeout(r, 150));
-    profiles = await browserbear('profiles').catch(() => '');
-  }
   assert.match(profiles, /● Work \(me@example\.com, Profile 2\)/);
   // The setup page hears that the host started, reached the service, and
   // what agents call this profile.
@@ -99,6 +58,7 @@ test('CLI -> service -> host -> fake extension and back', async (t) => {
   const snap = await browserbear('claim', 'studio');
   assert.match(snap, /tab 7: Studio/);
   assert.match(snap, /e1 button "Upload"/);
+  assert.match(snap, /e2 file-input #video-file accept="video\/\*" \[hidden\]$/m);
 
   const after = await browserbear('click', '7', 'e1');
   assert.match(after, /\(no change\)/);

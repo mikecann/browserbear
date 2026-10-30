@@ -4,6 +4,7 @@
 //   e4 button "Upload videos"
 //   e7 textbox "Title" = "My video"
 //   e9 checkbox "Made for kids" [checked]
+//   e11 file-input #video-file accept="video/*" [hidden]
 //
 // Only headings (for orientation) and things you can interact with make the
 // cut; a full tree runs 14-19k tokens on real sites, this is usually under 1k.
@@ -50,11 +51,28 @@ const clip = (s) => {
 
 const propValue = (node, name) => node.properties?.find((p) => p.name === name)?.value?.value;
 
-export function compact(axNodes, refs) {
+// File inputs come from the DOM (service.mjs's fileInputs), not the
+// accessibility tree: sites hide the real one behind a styled "Choose files"
+// button, and a hidden element isn't in the tree at all. Without them listed,
+// an agent has nothing to pass to upload (Adobe Podcast Enhance, 30 Oct).
+function fileInputLine(ref, f, axName, hidden) {
+  let text = `${ref} file-input`;
+  const name = axName || clip(f.label);
+  if (name) text += ` "${name}"`;
+  if (f.id) text += ` #${f.id}`;
+  if (f.accept) text += ` accept="${clip(f.accept)}"`;
+  const flags = [f.multiple && 'multiple', f.disabled && 'disabled', hidden && 'hidden'].filter(Boolean);
+  if (flags.length) text += ` [${flags.join(', ')}]`;
+  return text;
+}
+
+// fileInputs: backendDOMNodeId -> { id, label, accept, multiple, disabled }
+export function compact(axNodes, refs, fileInputs = new Map()) {
   const byId = new Map(axNodes.map((n) => [n.nodeId, n]));
   const root = axNodes.find((n) => !n.parentId) || axNodes[0];
   const lines = [];
   const seen = new Set();
+  const shown = new Set(); // file inputs the tree already had
 
   const walk = (node) => {
     if (!node || seen.has(node.nodeId)) return;
@@ -62,7 +80,10 @@ export function compact(axNodes, refs) {
     const role = node.role?.value;
     const name = clip(node.name?.value);
     if (!node.ignored) {
-      if (role === 'heading' && name) {
+      if (fileInputs.has(node.backendDOMNodeId)) {
+        shown.add(node.backendDOMNodeId);
+        lines.push(fileInputLine(refs.ref(node.backendDOMNodeId), fileInputs.get(node.backendDOMNodeId), name, false));
+      } else if (role === 'heading' && name) {
         lines.push(`${'#'.repeat(Math.min(Number(propValue(node, 'level')) || 2, 6))} ${name}`);
       } else if (LANDMARKS.has(role)) {
         lines.push(`[${role}${name ? ` "${name}"` : ''}]`);
@@ -84,6 +105,8 @@ export function compact(axNodes, refs) {
     for (const id of node.childIds || []) walk(byId.get(id));
   };
   walk(root);
+  // The rest aren't in the tree, so they're hidden; they go at the end.
+  for (const [id, f] of fileInputs) if (!shown.has(id)) lines.push(fileInputLine(refs.ref(id), f, '', true));
   return lines;
 }
 

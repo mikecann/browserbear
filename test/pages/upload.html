@@ -1,0 +1,68 @@
+<!doctype html>
+<!-- The ways sites hide a file input behind something nicer to click, each
+     reporting what it was given in its <output>. upload.test.mjs uploads to
+     every one of them in real (headless) Chrome. -->
+<meta charset="utf-8" />
+<title>Uploads</title>
+<style>
+  .btn { display: inline-block; padding: 8px 14px; border-radius: 6px; background: #222; color: #fff; cursor: pointer; }
+</style>
+
+<h1>Uploads</h1>
+
+<!-- Like Adobe Podcast Enhance: a hidden input, and a button whose handler clicks it. -->
+<section id="adobe">
+  <input type="file" id="enhance-file-upload" accept=".mp3,.wav" multiple style="display: none" />
+  <button class="btn" type="button">Choose files</button>
+  <output></output>
+</section>
+
+<!-- A styled label wrapping a hidden input. -->
+<section id="label">
+  <label class="btn">Add photo <input type="file" accept="image/*" hidden /></label>
+  <output></output>
+</section>
+
+<!-- An input made on the spot when the button is clicked, never added to the page. -->
+<section id="detached">
+  <div class="btn" role="button" tabindex="0">Attach</div>
+  <output></output>
+</section>
+
+<!-- The File System Access API: there's no input to fill. -->
+<section id="fsa">
+  <button class="btn" type="button">Open with the file system API</button>
+  <output></output>
+</section>
+
+<script>
+  const report = (section) => (e) => {
+    section.querySelector('output').textContent = [...e.target.files].map((f) => `${f.name} (${f.size})`).join(', ');
+  };
+
+  const adobe = document.querySelector('#adobe');
+  const input = adobe.querySelector('input');
+  input.addEventListener('change', report(adobe));
+  adobe.querySelector('button').addEventListener('click', () => input.click());
+
+  const label = document.querySelector('#label');
+  label.querySelector('input').addEventListener('change', report(label));
+
+  const detached = document.querySelector('#detached');
+  detached.querySelector('[role=button]').addEventListener('click', async () => {
+    await new Promise((r) => setTimeout(r, 100)); // an uploader that loads lazily
+    const made = document.createElement('input');
+    made.type = 'file';
+    made.addEventListener('change', report(detached));
+    made.click();
+  });
+
+  const fsa = document.querySelector('#fsa');
+  fsa.querySelector('button').addEventListener('click', async () => {
+    try {
+      await window.showOpenFilePicker();
+    } catch (e) {
+      fsa.querySelector('output').textContent = e.name;
+    }
+  });
+</script>

@@ -22,7 +22,9 @@ const USAGE = `browserbear: let agents use your real Chrome profiles
   browserbear read <tab>                        the page's text
   browserbear shot <tab> [file]                 screenshot, prints the PNG path
   browserbear eval <tab> <js>
-  browserbear upload <tab> <ref> <file...>
+  browserbear upload <tab> <ref|selector> <file...>
+                                                the file input, or the button or label that opens one
+                                                ("Choose files"); snap lists hidden inputs as file-input
   browserbear download <tab> <url> [filename]
   browserbear dialog <tab> accept|dismiss [text]
   browserbear show <tab>                        bring a tab forward in its window (real clicks need it)

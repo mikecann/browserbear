@@ -140,12 +140,18 @@ async function fileInputs(tabId) {
   try {
     const { root } = await cdp(tabId, 'DOM.getDocument', { depth: 0 });
     const { nodeIds } = await cdp(tabId, 'DOM.querySelectorAll', { nodeId: root.nodeId, selector: 'input[type=file]' });
-    const nodes = await Promise.all(nodeIds.map((nodeId) => cdp(tabId, 'DOM.describeNode', { nodeId }).then((r) => r.node)));
+    if (!nodeIds.length) return new Map();
+    // A styled <label> isn't a control in the tree, so its text is the only
+    // name the input has. Same order as querySelectorAll above.
+    const [nodes, labels] = await Promise.all([
+      Promise.all(nodeIds.map((nodeId) => cdp(tabId, 'DOM.describeNode', { nodeId }).then((r) => r.node))),
+      evaluate(tabId, `[...document.querySelectorAll('input[type=file]')].map((i) => i.labels?.[0]?.innerText || i.getAttribute('aria-label') || i.title || '')`).catch(() => []),
+    ]);
     return new Map(
-      nodes.map((n) => {
+      nodes.map((n, i) => {
         const a = {};
-        for (let i = 0; i < (n.attributes?.length || 0); i += 2) a[n.attributes[i]] = n.attributes[i + 1];
-        return [n.backendNodeId, { id: a.id, label: a['aria-label'] || a.title, accept: a.accept, multiple: 'multiple' in a, disabled: 'disabled' in a }];
+        for (let j = 0; j < (n.attributes?.length || 0); j += 2) a[n.attributes[j]] = n.attributes[j + 1];
+        return [n.backendNodeId, { id: a.id, label: labels[i], accept: a.accept, multiple: 'multiple' in a, disabled: 'disabled' in a }];
       }),
     );
   } catch {
