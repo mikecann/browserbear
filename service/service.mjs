@@ -32,15 +32,21 @@ const sentTo = new Map(); // tabId -> pages an agent opened or sent it to
 let nextId = 1;
 
 // Chrome's own list of profiles, so "Work" or "Profile 2" or the email
-// all find the same one. Read fresh each time: profiles come and go.
+// all find the same one. Read fresh each time: profiles come and go. Null when
+// it can't be read: macOS refuses this file to other apps (EPERM on Mike's Mac,
+// 31 Oct, even for a service Chrome started), and extensions can only learn a
+// profile's email, so then the email is the only name a profile has.
 function chromeProfiles() {
   try {
     const cache = JSON.parse(fs.readFileSync(LOCAL_STATE, 'utf8')).profile?.info_cache || {};
     return Object.entries(cache).map(([dir, p]) => ({ dir, name: p.name, email: p.user_name || null }));
-  } catch {
-    return [];
+  } catch (e) {
+    log('cannot read Chrome profiles:', e.message);
+    return null;
   }
 }
+
+const NO_NAMES = "BrowserBear can't read Chrome's list of profiles (macOS may be blocking it), so names and folders like \"Default\" won't work here; use the email";
 
 function describe(p) {
   return p.name ? `${p.name}${p.email ? ` (${p.email})` : ''}` : p.email || p.instance.slice(0, 8);
@@ -56,7 +62,7 @@ function findProfile(want) {
   const hit =
     all.find((p) => [p.name, p.email, p.dir].some((v) => v?.toLowerCase() === w)) ||
     all.find((p) => [p.name, p.email].some((v) => v?.toLowerCase().includes(w)));
-  if (!hit) throw new Error(`no connected profile matches "${want}"; connected: ${all.map(describe).join(', ') || 'none'}`);
+  if (!hit) throw new Error(`no connected profile matches "${want}"; connected: ${all.map(describe).join(', ') || 'none'}${chromeProfiles() ? '' : `. ${NO_NAMES}`}`);
   return hit;
 }
 
@@ -133,6 +139,39 @@ const PROBE_MS = Math.min(4_000, CDP_WAIT_MS);
 
 async function cdp(tabId, method, params, timeoutMs = CDP_WAIT_MS) {
   const p = await ownerOf(tabId);
+  try {
+    return await send(p, tabId, method, params, timeoutMs);
+  } catch (e) {
+    if (!/Cannot attach to this target/.test(e.message)) throw e;
+    throw await refusal(p, tabId);
+  }
+}
+
+// What went wrong loading a tab's page, if anything, as the extension saw it.
+function loadFailure(tab) {
+  if (!tab?.loadError) return null;
+  const host = hostOf(tab.url);
+  const what = /ERR_CERT/.test(tab.loadError) ? `certificate error on ${host}` : `${host} didn't load`;
+  return `${what} (${tab.loadError}): tab ${tab.tabId} is on Chrome's error page`;
+}
+
+const wayOut = (tabId) => `browserbear goto ${tabId} <url> still works, or browserbear close ${tabId}`;
+
+// Chrome won't let a debugger into its warning pages (certificate errors, Safe
+// Browsing) or the Web Store, and "Cannot attach to this target" says nothing
+// about that: a tab on a host with the wrong certificate looked broken for
+// good (vireo.de, 31 Oct). `refused` lets the waits below stop early, since
+// waiting won't get us in.
+async function refusal(p, tabId) {
+  const tab = (await call(p, 'tabs').catch(() => [])).find((t) => t.tabId === tabId);
+  const failure = loadFailure(tab);
+  const why = failure
+    ? `${failure}, so read, snap and eval can't get in`
+    : `Chrome won't let BrowserBear into tab ${tabId} (${tab ? `"${tab.title}" <${tab.url}>` : 'it may be gone'}): it's one of Chrome's warning pages, or a page extensions are kept out of, like the Web Store`;
+  return Object.assign(new Error(`${why}. ${wayOut(tabId)}`), { refused: true });
+}
+
+async function send(p, tabId, method, params, timeoutMs) {
   // Input has its own short wait, where running out means "probably landed".
   if (method.startsWith('Input.')) return call(p, 'cdp', { tabId, method, params }, timeoutMs);
   if (state(tabId).stuck) await stillStuck(p, tabId);
@@ -304,7 +343,9 @@ async function settleAfterAction(tabId, timeoutMs = 20_000) {
   let navigated = false;
   while (Date.now() < until) {
     // Mid-navigation there may be no context to evaluate in yet.
-    const [mark, ready] = (await evaluate(tabId, `[window.__browserbear ?? null, document.readyState]`).catch(() => null)) || ['leaving'];
+    // Refused: it went to a warning page, which won't change by waiting, and
+    // the snapshot after this says so.
+    const [mark, ready] = (await evaluate(tabId, `[window.__browserbear ?? null, document.readyState]`).catch((e) => (e.refused ? ['here'] : null))) || ['leaving'];
     if (mark === 'here') break;
     if (mark === null) navigated = true;
     if (mark === 'leaving' && !navigated && Date.now() > leavingUntil) break;
@@ -535,10 +576,16 @@ async function evaluate(tabId, expression) {
   return r.result.value;
 }
 
+// For the waits on a page to load: a refusal won't get better by trying again.
+const unlessRefused = (e) => {
+  if (e.refused) throw e;
+  return null;
+};
+
 async function waitForReady(tabId, timeoutMs = 20_000) {
   const until = Date.now() + timeoutMs;
   while (Date.now() < until) {
-    const ready = await evaluate(tabId, 'document.readyState').catch(() => null);
+    const ready = await evaluate(tabId, 'document.readyState').catch(unlessRefused);
     if (ready === 'complete') return;
     await new Promise((r) => setTimeout(r, 250));
   }
@@ -604,7 +651,9 @@ const commands = {
 
   async profiles() {
     const connected = [...profiles.values()];
-    return chromeProfiles().map((p) => {
+    const known = chromeProfiles();
+    if (!known) return [...connected.map((p) => `● ${describe(p)}`), `(${NO_NAMES})`].join('\n');
+    return known.map((p) => {
       const c = connected.find((x) => x.email && x.email === p.email);
       return `${c ? '●' : '○'} ${p.name} (${p.email || 'not signed in'}, ${p.dir})${c ? '' : ': extension not connected'}`;
     }).join('\n');
@@ -629,7 +678,13 @@ const commands = {
     marks.used(tab.tabId, thread, `opening ${hostOf(url)}`);
     bearTabs.add(tab.tabId);
     sent(tab.tabId, url);
-    const snap = await snapshot(tab.tabId);
+    // The agent still needs the tab's id to get out of a page that failed.
+    const failure = loadFailure(tab);
+    if (failure) throw new Error(`opened tab ${tab.tabId} in ${describe(p)}, but: ${failure}. ${wayOut(tab.tabId)}`);
+    const snap = await snapshot(tab.tabId).catch((e) => {
+      if (e.refused) e.message = `opened tab ${tab.tabId} in ${describe(p)}, but: ${e.message}`;
+      throw e;
+    });
     return `opened tab ${tab.tabId} in ${describe(p)}, in BrowserBear's own window\n${snap}${await handoffHint(tab.tabId)}`;
   },
 
@@ -703,11 +758,23 @@ const commands = {
   },
 
   async goto({ tab, url }) {
-    // Page events (the leave-site dialog among them) only arrive once enabled.
-    await cdp(tab, 'Page.enable');
-    await cdp(tab, 'Page.navigate', { url });
+    const p = await ownerOf(tab);
+    try {
+      // Page events (the leave-site dialog among them) only arrive once enabled.
+      await cdp(tab, 'Page.enable');
+      await cdp(tab, 'Page.navigate', { url });
+    } catch (e) {
+      if (!e.refused) throw e;
+      await call(p, 'navigate', { tabId: tab, url }, 40_000).catch((e) => {
+        if (/unknown op/.test(e.message)) throw new Error(`${describe(p)} has an older BrowserBear extension, which can't leave Chrome's warning pages; browserbear reload, then try again`);
+        throw e;
+      });
+    }
     sent(tab, url);
-    await waitForReady(tab);
+    // Refused here means it landed on a warning page, explained just below.
+    await waitForReady(tab).catch(() => {});
+    const failure = loadFailure((await call(p, 'tabs')).find((t) => t.tabId === tab));
+    if (failure) throw new Error(`${failure}. ${wayOut(tab)}`);
     return (await snapshot(tab)) + (await handoffHint(tab));
   },
 
@@ -720,7 +787,7 @@ const commands = {
     let text = null;
     for (let i = 0; i < 20 && typeof text !== 'string'; i++) {
       if (i) await sleep(250);
-      text = await evaluate(tab, 'document.body?.innerText ?? null').catch(() => null);
+      text = await evaluate(tab, 'document.body?.innerText ?? null').catch(unlessRefused);
     }
     if (typeof text !== 'string') throw new Error(`tab ${tab} has no page to read yet; try again in a moment`);
     if (text.length <= max) return text;
@@ -893,7 +960,7 @@ const server = net.createServer((conn) => {
     lineReader((msg) => {
       if (msg.type === 'hello') {
         role = 'host';
-        const known = chromeProfiles().find((p) => p.email && p.email === msg.email) || {};
+        const known = chromeProfiles()?.find((p) => p.email && p.email === msg.email) || {};
         const old = profiles.get(msg.instance);
         // Same profile reconnecting: keep pending calls' bookkeeping fresh.
         if (old && old.conn !== conn) old.conn.destroy();

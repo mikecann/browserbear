@@ -78,6 +78,25 @@ async function onMessage(msg) {
   }
 }
 
+// Why the page in a tab didn't load, for the service to tell agents: Chrome
+// keeps debuggers out of its warning pages, so this is the only place that can
+// say what went wrong. Only counts while the tab is still on the failed URL.
+const loadErrors = new Map(); // tabId -> { url, error }
+
+chrome.webNavigation.onBeforeNavigate.addListener(({ tabId, frameId }) => {
+  if (frameId === 0) loadErrors.delete(tabId);
+});
+
+chrome.webNavigation.onErrorOccurred.addListener(({ tabId, frameId, url, error }) => {
+  // ERR_ABORTED isn't a failure: a download, or another navigation took over.
+  if (frameId === 0 && error !== 'net::ERR_ABORTED') loadErrors.set(tabId, { url, error });
+});
+
+const loadError = (t) => {
+  const failed = loadErrors.get(t.id);
+  return failed && failed.url === t.url ? failed.error : undefined;
+};
+
 const tabInfo = (t) => ({
   tabId: t.id,
   windowId: t.windowId,
@@ -87,6 +106,7 @@ const tabInfo = (t) => ({
   active: t.active,
   groupId: t.groupId,
   status: t.status,
+  loadError: loadError(t),
 });
 
 // Which window is yours, as opposed to BrowserBear's own: the one you last had in
@@ -142,6 +162,28 @@ const ops = {
       tab = made.tabs[0];
     }
     return tabInfo(await waitForLoad(tab.id));
+  },
+
+  // Navigates without the debugger, which Chrome won't attach to a tab on one
+  // of its warning pages: the way out of a certificate error.
+  async navigate({ tabId, url }) {
+    // The old page counts as loaded until the new one starts, so wait for
+    // that first. A URL that only downloads never starts loading.
+    const started = new Promise((resolve) => {
+      const finish = () => {
+        clearTimeout(timer);
+        chrome.tabs.onUpdated.removeListener(listener);
+        resolve();
+      };
+      const listener = (id, change) => {
+        if (id === tabId && change.status === 'loading') finish();
+      };
+      const timer = setTimeout(finish, 5_000);
+      chrome.tabs.onUpdated.addListener(listener);
+    });
+    await chrome.tabs.update(tabId, { url });
+    await started;
+    return tabInfo(await waitForLoad(tabId));
   },
 
   // Brings a tab to the front of its window without focusing the window, so
@@ -275,6 +317,7 @@ chrome.tabs.onUpdated.addListener(async (tabId, change) => {
 });
 
 chrome.tabs.onRemoved.addListener(async (tabId) => {
+  loadErrors.delete(tabId);
   const all = await markStore();
   if (!(tabId in all)) return;
   delete all[tabId];

@@ -24,7 +24,9 @@ browserbear CLI (or Threadbear)
 ```
 
 - Profiles are named the way Chrome names them ("Work"), or by email or folder,
-  never by a number that changes between connects.
+  never by a number that changes between connects. Names and folders come from
+  Chrome's `Local State` file; where macOS blocks that, only the email works, and
+  `browserbear profiles` says so.
 - Snapshots list headings and things you can click or type in, with refs (`e12`) that
   stay on the same element. After the first look you get only what changed, so most
   steps cost a few hundred tokens rather than 15k.
@@ -109,6 +111,12 @@ told to wait or open the page fresh; after that, each command takes a quick look
 first rather than waiting the full 20 s. If Chrome doesn't answer either, the
 debugger session is stuck, so BrowserBear drops it and starts a fresh one,
 sending the command again only if it just reads the page.
+
+A page that fails to load comes back as an error from `open` and `goto` saying why
+(`certificate error on example.com (net::ERR_CERT_COMMON_NAME_INVALID)`), with the
+tab's id, rather than looking like success. Chrome keeps debuggers out of its warning
+pages (certificate errors, Safe Browsing), so `read`, `snap` and `eval` name the problem
+there, and `goto` still gets the tab out, through `chrome.tabs` instead of the debugger.
 
 A real click on a link that changes nothing but focus gets clicked again by
 script, since following a link twice is harmless. For anything else that ignores
