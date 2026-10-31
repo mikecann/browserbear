@@ -142,6 +142,11 @@ async function cdp(tabId, method, params, timeoutMs = CDP_WAIT_MS) {
   try {
     return await send(p, tabId, method, params, timeoutMs);
   } catch (e) {
+    // A ref from before the tab went to another page, which Chrome only
+    // reports as "Node with given id does not belong to the document".
+    if (/does not belong to the document|No node with given id|Could not find node with given id/.test(e.message)) {
+      throw new Error(`that ref is from a page tab ${tabId} has since left; snap ${tabId} for fresh refs`);
+    }
     if (!/Cannot attach to this target/.test(e.message)) throw e;
     throw await refusal(p, tabId);
   }
@@ -305,10 +310,57 @@ async function fileInputs(tabId) {
   }
 }
 
+// BrowserBear's window usually sits behind your other windows or on a screen
+// you aren't looking at, and Chrome stops drawing a window that's covered:
+// its pages go hidden, with no animation frames, IntersectionObservers or
+// ResizeObservers. Pages that draw lazily then never fill in; YouTube Studio's
+// analytics showed the Reach tab over an empty body (31 Oct). Focus emulation
+// has Chrome treat the page as visible and focused while the debugger is
+// attached, and the extension detaches after 30 s idle, so it's checked before
+// every look. Only agents' tabs: one of your own pages thinking it has focus
+// could, say, mark your messages read.
+async function wake(tabId) {
+  if (state(tabId).dialog) return;
+  const visibility = await evaluate(tabId, 'document.visibilityState').catch(() => null);
+  if (visibility !== 'hidden') return;
+  if (!bearTabs.has(tabId)) {
+    const tab = (await call(await ownerOf(tabId), 'tabs')).find((t) => t.tabId === tabId);
+    if (!tab?.agent) return;
+  }
+  await cdp(tabId, 'Emulation.setFocusEmulationEnabled', { enabled: true });
+  await drawn(tabId); // what it held back
+}
+
+// Loaded isn't drawn: an app like YouTube Studio fetches and draws its
+// reports for another 2-3 s after readyState is complete, and a read straight
+// after goto got the page's frame with nothing in it (31 Oct). So this waits
+// until nothing has been added or removed for a moment. Text changing in
+// place doesn't count, or a live counter would hold it to the cap.
+const QUIET_MS = 500;
+const DRAWN_CAP_MS = 6_000;
+const DRAWN = `new Promise((resolve) => {
+  let quiet;
+  const done = () => { watch.disconnect(); clearTimeout(quiet); clearTimeout(cap); resolve(true); };
+  const element = (n) => n.nodeType === 1;
+  const watch = new MutationObserver((records) => {
+    if (!records.some((r) => [...r.addedNodes, ...r.removedNodes].some(element))) return;
+    clearTimeout(quiet);
+    quiet = setTimeout(done, ${QUIET_MS});
+  });
+  watch.observe(document, { subtree: true, childList: true });
+  quiet = setTimeout(done, ${QUIET_MS});
+  const cap = setTimeout(done, ${DRAWN_CAP_MS});
+})`;
+
+async function drawn(tabId) {
+  await evaluate(tabId, DRAWN).catch(() => {});
+}
+
 async function snapshot(tabId, { full = false } = {}) {
   const s = state(tabId);
   // A JS dialog freezes the page, so every other call would just time out.
   if (s.dialog) return `tab ${tabId}\n${dialogLine(tabId, s.dialog)}`;
+  await wake(tabId);
   await cdp(tabId, 'Page.enable');
   const [{ nodes }, files] = await Promise.all([cdp(tabId, 'Accessibility.getFullAXTree'), fileInputs(tabId)]);
   const lines = compact(nodes, s.refs, files);
@@ -681,6 +733,8 @@ const commands = {
     // The agent still needs the tab's id to get out of a page that failed.
     const failure = loadFailure(tab);
     if (failure) throw new Error(`opened tab ${tab.tabId} in ${describe(p)}, but: ${failure}. ${wayOut(tab.tabId)}`);
+    await wake(tab.tabId);
+    await drawn(tab.tabId);
     const snap = await snapshot(tab.tabId).catch((e) => {
       if (e.refused) e.message = `opened tab ${tab.tabId} in ${describe(p)}, but: ${e.message}`;
       throw e;
@@ -773,6 +827,8 @@ const commands = {
     sent(tab, url);
     // Refused here means it landed on a warning page, explained just below.
     await waitForReady(tab).catch(() => {});
+    await wake(tab);
+    await drawn(tab);
     const failure = loadFailure((await call(p, 'tabs')).find((t) => t.tabId === tab));
     if (failure) throw new Error(`${failure}. ${wayOut(tab)}`);
     return (await snapshot(tab)) + (await handoffHint(tab));
@@ -784,6 +840,8 @@ const commands = {
     // page to evaluate in at all (passport.service.gov.uk, 30 Oct): wait for
     // one rather than fail.
     await waitForReady(tab, 10_000);
+    await wake(tab);
+    await drawn(tab);
     let text = null;
     for (let i = 0; i < 20 && typeof text !== 'string'; i++) {
       if (i) await sleep(250);
@@ -797,12 +855,16 @@ const commands = {
   },
 
   async shot({ tab, file }) {
+    await wake(tab);
     const { data } = await cdp(tab, 'Page.captureScreenshot', { format: 'png' });
     file ||= path.join(OUT, `tab-${tab}-${Date.now()}.png`);
     fs.writeFileSync(file, Buffer.from(data, 'base64'), { mode: 0o600 });
     return file;
   },
 
+  // No wake here: its look first would hide a stuck session from the eval.
+  // goto, snap and read have already woken the page, and it stays awake for
+  // as long as the session does.
   eval: ({ tab, js }) => evaluate(tab, js),
 
   // Raw CDP, for debugging BrowserBear itself and for anything it doesn't wrap yet.
