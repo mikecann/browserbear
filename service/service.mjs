@@ -783,6 +783,49 @@ async function evalIn(tabId, id, doc, expression, { timeoutMs = PROBE_MS, byValu
   return cdp(tabId, 'Runtime.evaluate', { expression, returnByValue: byValue, contextId: executionContextId }, timeoutMs, doc.session);
 }
 
+// A frame's text for read. A body that isn't rendered (its iframe is
+// display:none, or the frame has no size) gives textContent from innerText,
+// inline scripts and all: Gmail's hidden studio.workspace.google.com helper
+// frame put 4 KB of JavaScript into read (11 Nov). So only a drawn body is read.
+const FRAME_TEXT = `(() => {
+  const b = document.body;
+  // A display:contents body has no box of its own but its children are drawn,
+  // and innerText reads it as rendered.
+  const drawn = b && (b.checkVisibility() || (getComputedStyle(b).display === 'contents' && document.documentElement.checkVisibility()));
+  if (!drawn || !innerWidth || !innerHeight) return '';
+  return b.innerText;
+})()`;
+
+// Whether the iframe holding a frame is drawn with some size, asked of the
+// element in its parent: visibility:hidden on the iframe, or a 0x0 one, isn't
+// something the frame can always see from inside. A frame 1px across counts as
+// hidden too: that's a tracking pixel, not something to read. Unknown counts as shown, so
+// a slow parent doesn't lose a frame's text.
+async function frameShown(tabId, id, d, docs) {
+  try {
+    const parent = d.parent === null ? null : docs.has(d.parent) ? docs.get(d.parent).session : d.parent;
+    const { backendNodeId } = await cdp(tabId, 'DOM.getFrameOwner', { frameId: id }, PROBE_MS, parent);
+    const { object } = await cdp(tabId, 'DOM.resolveNode', { backendNodeId }, PROBE_MS, parent);
+    const { result } = await cdp(
+      tabId,
+      'Runtime.callFunctionOn',
+      {
+        objectId: object.objectId,
+        functionDeclaration: `function () {
+          const r = this.getBoundingClientRect();
+          return r.width > 1 && r.height > 1 && this.checkVisibility({ visibilityProperty: true, opacityProperty: true });
+        }`,
+        returnByValue: true,
+      },
+      PROBE_MS,
+      parent,
+    );
+    return result?.value !== false;
+  } catch {
+    return true;
+  }
+}
+
 // The accessibility tree of each iframe, which element in its parent holds
 // it, and a cross-origin one's file inputs.
 async function frameTrees(tabId) {
@@ -1858,8 +1901,13 @@ const commands = {
     if (typeof text !== 'string') throw new Error(`tab ${tab} has no page to read yet; try again in a moment`);
     // innerText stops at an iframe, so each one is read by itself (a
     // same-origin one too, which the page's innerText doesn't include either).
-    const frames = [...(await documents(tab))];
-    const inner = await Promise.all(frames.map(([id, d]) => evalIn(tab, id, d, 'document.body?.innerText ?? ""').then((r) => r.result?.value, () => '')));
+    const docs = await documents(tab);
+    const frames = [...docs];
+    // A frame inside a hidden one is hidden too, though its own iframe looks
+    // fine from inside the hidden document (Codex's review, 11 Nov).
+    const own = new Map(await Promise.all(frames.map(async ([id, d]) => [id, await frameShown(tab, id, d, docs)])));
+    const shown = (id) => id === null || !docs.has(id) || (own.get(id) && shown(docs.get(id).parent));
+    const inner = await Promise.all(frames.map(([id, d]) => (shown(id) ? evalIn(tab, id, d, FRAME_TEXT).then((r) => r.result?.value, () => '') : '')));
     frames.forEach(([, f], i) => {
       if (typeof inner[i] === 'string' && inner[i].trim()) text += `\n\n[frame ${hostOf(f.url) || f.url}]\n${inner[i]}`;
     });

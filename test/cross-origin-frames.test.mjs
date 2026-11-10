@@ -20,7 +20,12 @@ const TOP = (framePort, samePort) => `<!doctype html><title>Signup</title>
 <iframe src="/same" style="height: 60px"></iframe>
 <div style="margin: 300px 0 0 120px" role="dialog" aria-label="Create a payments profile">
   <iframe src="http://localhost:${framePort}/frame" style="width: 420px; height: 240px; border: 7px solid #ccc"></iframe>
-</div>`;
+</div>
+<iframe src="http://localhost:${framePort}/helper" style="display: none"></iframe>
+<iframe src="http://localhost:${framePort}/helper" width="0" height="0" style="border: 0"></iframe>
+<iframe src="http://localhost:${framePort}/helper"></iframe>
+<iframe src="http://localhost:${framePort}/nest" style="opacity: 0"></iframe>
+<iframe src="http://localhost:${framePort}/contents"></iframe>`;
 
 const FRAME = `<!doctype html><title>Payments</title>
 <p>Verify your identity</p>
@@ -28,6 +33,17 @@ const FRAME = `<!doctype html><title>Payments</title>
 <p id="said">not clicked</p>
 <input type="file" id="id-doc" hidden>
 <button style="margin-top: 60px" onclick="said.textContent = 'clicked with ' + duns.value">Verify</button>`;
+
+// A helper frame with nothing to read, like the hidden
+// studio.workspace.google.com one in Gmail, whose inline scripts read
+// printed as text (11 Nov). The page has it hidden, at 0x0 and shown.
+const HELPER = `<!doctype html><script>window.IJ_values = ['helper script'];</script>
+<style>.x { color: red }</style><noscript>helper noscript</noscript><div hidden>helper hidden div</div>`;
+
+// A frame shown inside a hidden one is hidden too; a body with
+// display:contents is still drawn (Codex's review, 11 Nov).
+const NEST = (port) => `<iframe src="http://127.0.0.1:${port}/nested"></iframe>`;
+const CONTENTS = '<body style="display: contents"><p>Payment instructions</p></body>';
 
 // Another port on the same host is cross-origin but the same site, so it
 // shares the page's process: no session of its own, and still not in the
@@ -40,11 +56,11 @@ const SAME_SITE = `<p>Same site</p><button onclick="this.textContent = 'Pressed'
 test('snap, read, click and type reach into a cross-origin iframe', { skip: !CFT && 'no Chrome for Testing' }, async (t) => {
   const server = http.createServer((req, res) => {
     res.setHeader('content-type', 'text/html');
-    res.end(req.url === '/frame' ? FRAME : req.url === '/same' ? '<button>Same origin</button>' : TOP(server.address().port, sameSite.address().port));
+    res.end(req.url === '/helper' ? HELPER : req.url === '/nest' ? NEST(sameSite.address().port) : req.url === '/contents' ? CONTENTS : req.url === '/frame' ? FRAME : req.url === '/same' ? '<button>Same origin</button>' : TOP(server.address().port, sameSite.address().port));
   });
   const sameSite = http.createServer((req, res) => {
     res.setHeader('content-type', 'text/html');
-    res.end(req.url === '/inner' ? '<button>Inner</button>' : SAME_SITE);
+    res.end(req.url === '/inner' ? '<button>Inner</button>' : req.url === '/nested' ? '<p>Nested in a hidden frame</p>' : SAME_SITE);
   });
   for (const s of [server, sameSite]) {
     await new Promise((r) => s.listen(0, '127.0.0.1', r));
@@ -56,7 +72,7 @@ test('snap, read, click and type reach into a cross-origin iframe', { skip: !CFT
   const inWorker = await extensionInChrome(t);
   const tabId = await inWorker(`chrome.tabs.create({ url: ${JSON.stringify(url)} }).then((t) => new Promise((r) => setTimeout(() => r(t.id), 2000)))`);
   const frameText = (js) =>
-    inWorker(`ops.frames({ tabId: ${tabId} }).then(([f]) => ops.cdp({ tabId: ${tabId}, sessionId: f.sessionId, method: 'Runtime.evaluate', params: { expression: ${JSON.stringify(js)}, returnByValue: true } })).then((r) => r.result.value)`);
+    inWorker(`ops.frames({ tabId: ${tabId} }).then((fs) => fs.find((f) => f.url.endsWith('/frame'))).then((f) => ops.cdp({ tabId: ${tabId}, sessionId: f.sessionId, method: 'Runtime.evaluate', params: { expression: ${JSON.stringify(js)}, returnByValue: true } })).then((r) => r.result.value)`);
 
   const { browserbear } = await startBear(t, async ({ op, args }) => {
     if (op === 'tabs') return [{ tabId, url, title: 'Signup', active: true }];
@@ -77,6 +93,10 @@ test('snap, read, click and type reach into a cross-origin iframe', { skip: !CFT
   const text = await browserbear('read', String(tabId));
   assert.match(text, /Create a developer account[\s\S]*\[frame localhost:\d+\]\nVerify your identity/);
   assert.match(text, /\[frame 127\.0\.0\.1:\d+\]\nSame site/);
+  assert.doesNotMatch(text, /IJ_values|helper|color: red/);
+  assert.doesNotMatch(text, /Nested in a hidden frame/);
+  assert.match(text, /\[frame localhost:\d+\]\nPayment instructions/);
+  assert.equal(text.match(/\[frame localhost:\d+\]/g).length, 2, text);
 
   assert.match(await browserbear('click', String(tabId), ref('Accept')), /button "Pressed"/);
 
