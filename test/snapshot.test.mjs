@@ -37,6 +37,14 @@ test('file inputs are listed whether or not the tree has them', () => {
   assert.equal(lines.at(-1), 'e5 file-input #enhance-file-upload accept=".mp3,.wav" [multiple, hidden]');
 });
 
+test("a frame's lines go where its iframe is, or at the end if the tree hasn't got it", () => {
+  const iframe = { nodeId: '8', parentId: '1', role: { value: 'Iframe' }, backendDOMNodeId: 80 };
+  const inner = ['[frame payments.google.com]', 'e9 textbox "D-U-N-S number"'];
+  const lines = compact(page([iframe]), new RefMap(), new Map(), new Set(), new Map([[80, inner], [81, ['[frame recaptcha]']]]));
+  assert.deepEqual(lines.slice(-3), [...inner, '[frame recaptcha]']);
+  assert.equal(lines.indexOf('[frame payments.google.com]'), 5);
+});
+
 test('refs stay on the same node across snapshots', () => {
   const refs = new RefMap();
   compact(page(), refs);

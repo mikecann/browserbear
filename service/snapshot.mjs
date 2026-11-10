@@ -68,18 +68,25 @@ function fileInputLine(ref, f, axName, hidden) {
 }
 
 // fileInputs: backendDOMNodeId -> { id, label, accept, multiple, disabled }
-export function compact(axNodes, refs, fileInputs = new Map(), masked = new Set()) {
+// frames: backendDOMNodeId of an <iframe> -> the lines for what's inside it,
+// put in where the iframe is (a cross-origin one isn't in this tree).
+export function compact(axNodes, refs, fileInputs = new Map(), masked = new Set(), frames = new Map()) {
   const byId = new Map(axNodes.map((n) => [n.nodeId, n]));
   const root = axNodes.find((n) => !n.parentId) || axNodes[0];
   const lines = [];
   const seen = new Set();
   const shown = new Set(); // file inputs the tree already had
+  const placed = new Set(); // frames put in where they are
 
   const walk = (node) => {
     if (!node || seen.has(node.nodeId)) return;
     seen.add(node.nodeId);
     const role = node.role?.value;
     const name = clip(node.name?.value);
+    if (frames.has(node.backendDOMNodeId)) {
+      placed.add(node.backendDOMNodeId);
+      lines.push(...frames.get(node.backendDOMNodeId));
+    }
     if (!node.ignored) {
       if (fileInputs.has(node.backendDOMNodeId)) {
         shown.add(node.backendDOMNodeId);
@@ -106,6 +113,8 @@ export function compact(axNodes, refs, fileInputs = new Map(), masked = new Set(
     for (const id of node.childIds || []) walk(byId.get(id));
   };
   walk(root);
+  // A frame whose iframe the tree doesn't show still has controls worth listing.
+  for (const [id, inner] of frames) if (!placed.has(id)) lines.push(...inner);
   // The rest aren't in the tree, so they're hidden; they go at the end.
   for (const [id, f] of fileInputs) if (!shown.has(id)) lines.push(fileInputLine(refs.ref(id), f, '', true));
   return lines;

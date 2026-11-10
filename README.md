@@ -66,6 +66,13 @@ browserbear CLI (or Threadbear)
   it on HTML elements only. A frame can also say `about:blank` and then send itself to
   its extension's page (1Password's sign-on frame), so an iframe that says blank but
   whose document is shut to us counts too.
+- Cross-origin iframes (Google payments, Stripe, reCAPTCHA) run in their own process,
+  out of reach of the tab's debugger session. The extension and the agents' browser
+  attach to each one as a child session (`Target.setAutoAttach`), and the service
+  numbers its controls with the page's, under a `[frame <host>]` line where the iframe
+  is. `read` adds each frame's text, and `type -` follows focus into one. Clicks go to
+  the frame's own session at its own coordinates: sent to the tab, Chrome sometimes
+  still had the frame where it was before a scroll and gave the click to the page.
 - `key Shift+Enter` adds a line break in rich editors, and `type` keeps the newlines in
   its text. Neither sends a Discord message; only `Enter` or `--submit` do.
 
@@ -233,7 +240,6 @@ starts the real service, which the real CLI talks to. No Chrome needed.
 
 ## Not yet
 
-- Cross-origin iframes (Google sign-in, payment frames) aren't in snapshots.
 - No approvals yet for posting, sending or buying; Threadbear will own those.
 - No `secret_to` (move a key from a page into Convex env or Keychain without it
   passing through the agent).

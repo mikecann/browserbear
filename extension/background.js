@@ -16,6 +16,14 @@ const IDLE_DETACH_MS = 30_000;
 
 let port = null;
 const attached = new Map(); // tabId -> idle-detach timer
+// Cross-origin iframes run in their own process, so the tab's debugger session
+// can't see into them: a payments form in one (Google Play's signup, 10 Nov)
+// snapped as a bare [dialog]. Chrome attaches us to each one as a child
+// session once asked (Target.setAutoAttach), and commands for it go with its
+// sessionId. tabId -> Map(sessionId -> { targetId, url, parent sessionId })
+const frameSessions = new Map();
+const autoAttached = new Set(); // tabIds whose session has asked for them
+const AUTO_ATTACH = { autoAttach: true, waitForDebuggerOnStart: false, flatten: true, filter: [{ type: 'iframe' }] };
 // How far the chain to the Mac gets, for the setup page. An error is kept
 // through the 2 s retries until the host really answers, so the page doesn't
 // flicker between "checking" and "missing".
@@ -313,7 +321,7 @@ const ops = {
     return tabInfo(tab);
   },
 
-  async cdp({ tabId, method, params }) {
+  async cdp({ tabId, method, params, sessionId }) {
     // A screencast shows the page as it draws, so the pill stays out of it
     // for as long as the cast runs, not just around one command.
     if (method === 'Page.startScreencast') { casting.add(tabId); await hideMark(tabId); }
@@ -321,7 +329,7 @@ const ops = {
     if (COVERED.test(method)) await hideMark(tabId);
     try {
       await attach(tabId);
-      return await chrome.debugger.sendCommand({ tabId }, method, params || {});
+      return await chrome.debugger.sendCommand(sessionId ? { tabId, sessionId } : { tabId }, method, params || {});
     } catch (e) {
       const message = String(e?.message);
       const refused = message.includes('URL of different extension');
@@ -337,6 +345,13 @@ const ops = {
       // A command Chrome cut off may already have run (typed text, a
       // click), so it isn't sent again; one that was refused never ran.
       if (!refused) throw new Error(`${who} appeared mid-command and Chrome detached BrowserBear. It's cleared now; snap to see whether the command ran`);
+      // For one of the tab's iframes: getting back in starts a new tab session,
+      // which ends that frame's one. "session" has the service ask for frames
+      // again and send it once more.
+      if (sessionId) {
+        await attach(tabId).catch(() => {});
+        throw new Error(`${who} was cleared, which ended the frame's debugger session`);
+      }
       try {
         // Even with nothing found: the frame may have gone by itself already.
         await attach(tabId);
@@ -350,6 +365,23 @@ const ops = {
     } finally {
       if (COVERED.test(method) || method === 'Page.stopScreencast') showMarkSoon(tabId);
     }
+  },
+
+  // The tab's cross-origin iframes, each with the sessionId cdp takes for it.
+  async frames({ tabId }) {
+    await attach(tabId);
+    if (!autoAttached.has(tabId)) {
+      autoAttached.add(tabId);
+      try {
+        await chrome.debugger.sendCommand({ tabId }, 'Target.setAutoAttach', AUTO_ATTACH);
+      } catch (e) {
+        autoAttached.delete(tabId);
+        throw e;
+      }
+      // The frames already there arrive as events just after.
+      await new Promise((r) => setTimeout(r, 150));
+    }
+    return [...(frameSessions.get(tabId) || [])].map(([sessionId, f]) => ({ sessionId, ...f }));
   },
 
   // Draws (or, with no mark, takes off) the marks on an agent's tab; the
@@ -684,6 +716,7 @@ function waitForDownload(id, timeoutMs = 120_000) {
 
 async function attach(tabId) {
   if (!attached.has(tabId)) {
+    forgetFrames(tabId);
     try {
       await chrome.debugger.attach({ tabId }, '1.3');
       // So dialogs (like "Leave site?") are reported from the first command.
@@ -742,7 +775,13 @@ async function blankExtensionFrames(tabId) {
   return ids;
 }
 
+function forgetFrames(tabId) {
+  frameSessions.delete(tabId);
+  autoAttached.delete(tabId);
+}
+
 async function detach(tabId) {
+  forgetFrames(tabId);
   clearTimeout(attached.get(tabId));
   // Our own detach ends a cast without an onDetach.
   if (casting.delete(tabId)) showMarkSoon(tabId);
@@ -751,6 +790,7 @@ async function detach(tabId) {
 }
 
 chrome.debugger.onDetach.addListener(({ tabId }, reason) => {
+  forgetFrames(tabId);
   casting.delete(tabId);
   showMarkSoon(tabId);
   clearTimeout(attached.get(tabId));
@@ -758,7 +798,21 @@ chrome.debugger.onDetach.addListener(({ tabId }, reason) => {
   post({ type: 'event', event: 'detached', tabId, reason });
 });
 
-chrome.debugger.onEvent.addListener(({ tabId }, method, params) => {
+chrome.debugger.onEvent.addListener(({ tabId, sessionId }, method, params) => {
+  if (method === 'Target.attachedToTarget' && params.targetInfo?.type === 'iframe') {
+    if (!frameSessions.has(tabId)) frameSessions.set(tabId, new Map());
+    const { targetId, url } = params.targetInfo;
+    frameSessions.get(tabId).set(params.sessionId, { targetId, url, parent: sessionId || null });
+    // A cross-origin frame inside that one (reCAPTCHA in a payments form).
+    chrome.debugger.sendCommand({ tabId, sessionId: params.sessionId }, 'Target.setAutoAttach', AUTO_ATTACH).catch(() => {});
+    return;
+  }
+  if (method === 'Target.detachedFromTarget') {
+    frameSessions.get(tabId)?.delete(params.sessionId);
+    return;
+  }
+  // The rest is about the tab itself, not one of its frames.
+  if (sessionId) return;
   // Only what the service needs to know about; everything else stays here.
   if (method === 'Page.javascriptDialogOpening') post({ type: 'event', event: 'dialog', tabId, params });
   if (method === 'Page.javascriptDialogClosed') post({ type: 'event', event: 'dialogClosed', tabId });

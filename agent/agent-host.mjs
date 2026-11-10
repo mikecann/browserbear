@@ -134,6 +134,10 @@ let nextCdp = 1;
 const cdpWaiting = new Map();
 const sessions = new Map(); // targetId -> sessionId
 const sessionTarget = new Map(); // sessionId -> targetId
+// Cross-origin iframes, attached as child sessions of their tab's (see the
+// extension's frameSessions). sessionId -> { tabTarget, targetId, url, parent }
+const frameSessions = new Map();
+const AUTO_ATTACH = { autoAttach: true, waitForDebuggerOnStart: false, flatten: true, filter: [{ type: 'iframe' }] };
 
 function browserCall(method, params = {}, sessionId, timeoutMs = 30_000) {
   const id = nextCdp++;
@@ -271,6 +275,7 @@ async function sessionFor(tab) {
   const { sessionId } = await browserCall('Target.attachToTarget', { targetId: tab.targetId, flatten: true });
   sessions.set(tab.targetId, sessionId);
   sessionTarget.set(sessionId, tab.targetId);
+  tab.autoAttached = false;
   await browserCall('Page.enable', {}, sessionId);
   // So the page behaves as if it's in front when its window is behind others.
   await browserCall('Emulation.setFocusEmulationEnabled', { enabled: true }, sessionId).catch(() => {});
@@ -342,7 +347,17 @@ function onEvent(m) {
     }
     return;
   }
+  if (method === 'Target.attachedToTarget' && params.targetInfo?.type === 'iframe') {
+    const tabTarget = sessionTarget.get(sessionId) || frameSessions.get(sessionId)?.tabTarget;
+    if (!tabTarget) return;
+    const { targetId, url } = params.targetInfo;
+    frameSessions.set(params.sessionId, { tabTarget, targetId, url, parent: frameSessions.has(sessionId) ? sessionId : null });
+    // A cross-origin frame inside that one.
+    browserCall('Target.setAutoAttach', AUTO_ATTACH, params.sessionId).catch(() => {});
+    return;
+  }
   if (method === 'Target.detachedFromTarget') {
+    frameSessions.delete(params.sessionId);
     const targetId = sessionTarget.get(params.sessionId);
     sessionTarget.delete(params.sessionId);
     if (targetId) sessions.delete(targetId);
@@ -450,10 +465,23 @@ const ops = {
     return r?.result?.value ?? { signInForm: null, text: false };
   },
 
-  async cdp({ tabId, method, params }) {
+  async cdp({ tabId, method, params, sessionId }) {
     const tab = tabOf(tabId);
     tab.activeAt = Date.now();
-    return browserCall(method, params || {}, await sessionFor(tab));
+    if (sessionId && frameSessions.get(sessionId)?.tabTarget !== tab.targetId) throw new Error(`No session with given id: ${sessionId}`);
+    return browserCall(method, params || {}, sessionId || (await sessionFor(tab)));
+  },
+
+  // The tab's cross-origin iframes, each with the sessionId cdp takes for it.
+  async frames({ tabId }) {
+    const tab = tabOf(tabId);
+    const session = await sessionFor(tab);
+    if (!tab.autoAttached) {
+      await browserCall('Target.setAutoAttach', AUTO_ATTACH, session);
+      tab.autoAttached = true;
+      await sleep(150); // the frames already there arrive as events just after
+    }
+    return [...frameSessions].filter(([, f]) => f.tabTarget === tab.targetId).map(([sessionId, { targetId, url, parent }]) => ({ sessionId, targetId, url, parent }));
   },
 
   // The panel draws these. Nothing goes in the page, so a site can't see it.

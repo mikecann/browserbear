@@ -398,7 +398,9 @@ function hostOf(url) {
 }
 
 const state = (tabId) => {
-  if (!tabState.has(tabId)) tabState.set(tabId, { refs: new RefMap(), last: null, dialog: null });
+  // frames: the tab's cross-origin iframes by targetId, as loadFrames last saw
+  // them; objects: which frame a remote object id came from (objectId -> targetId).
+  if (!tabState.has(tabId)) tabState.set(tabId, { refs: new RefMap(), last: null, dialog: null, frames: new Map(), objects: new Map() });
   return tabState.get(tabId);
 };
 
@@ -407,10 +409,33 @@ const state = (tabId) => {
 const CDP_WAIT_MS = Number(process.env.BROWSERBEAR_CDP_WAIT_MS) || 20_000;
 const PROBE_MS = Math.min(4_000, CDP_WAIT_MS);
 
-async function cdp(tabId, method, params, timeoutMs = CDP_WAIT_MS) {
+// A node inside a cross-origin iframe is "<frame targetId>:<backendNodeId>",
+// since backend ids are only unique within a process; one in the tab's own
+// page is a plain number. cdp sends a command about either to the right
+// session, so the code that clicks and types needn't care which it has.
+const inFrame = (node) => typeof node === 'string';
+const frameNode = (frame, id) => (frame ? `${frame}:${id}` : id);
+const splitNode = (node) => {
+  const i = node.lastIndexOf(':');
+  return { frame: node.slice(0, i), id: Number(node.slice(i + 1)) };
+};
+
+// `frame` says which iframe a command without a node or object in it is for.
+async function cdp(tabId, method, params, timeoutMs = CDP_WAIT_MS, frame = null) {
   const p = await ownerOf(tabId);
+  const s = state(tabId);
+  if (inFrame(params?.backendNodeId)) {
+    const n = splitNode(params.backendNodeId);
+    frame = n.frame;
+    params = { ...params, backendNodeId: n.id };
+  } else if (!frame && params?.objectId) {
+    frame = s.objects.get(params.objectId) || null;
+  }
   try {
-    return await send(p, tabId, method, params, timeoutMs);
+    if (!frame) return await send(p, tabId, method, params, timeoutMs);
+    const result = await sendToFrame(p, tabId, frame, method, params, timeoutMs);
+    noteObjects(s, frame, result);
+    return result;
   } catch (e) {
     // A ref from before the tab went to another page, which Chrome only
     // reports as "Node with given id does not belong to the document".
@@ -428,6 +453,58 @@ async function cdp(tabId, method, params, timeoutMs = CDP_WAIT_MS) {
     if (!/Cannot attach to this target/.test(e.message)) throw e;
     throw await refusal(p, tabId);
   }
+}
+
+// The tab's cross-origin iframes, fresh from the extension (or the agents'
+// browser), as targetId -> { sessionId, url, parent targetId or null }. An
+// extension from before frames gives none, which is how pages looked before.
+async function loadFrames(tabId) {
+  const got = await call(await ownerOf(tabId), 'frames', { tabId }).catch(() => []);
+  const list = Array.isArray(got) ? got : [];
+  const bySession = new Map(list.map((f) => [f.sessionId, f.targetId]));
+  const frames = new Map(list.map((f) => [f.targetId, { sessionId: f.sessionId, url: f.url, parent: (f.parent && bySession.get(f.parent)) || null }]));
+  state(tabId).frames = frames;
+  return frames;
+}
+
+async function sendToFrame(p, tabId, frame, method, params, timeoutMs) {
+  let f = state(tabId).frames.get(frame);
+  for (let tries = 0; ; tries++) {
+    if (!f) f = (await loadFrames(tabId)).get(frame);
+    if (!f) throw new Error(`that ref is in a frame tab ${tabId} no longer has; snap ${tabId} for fresh refs`);
+    try {
+      return await call(p, 'cdp', { tabId, method, params, sessionId: f.sessionId }, timeoutMs);
+    } catch (e) {
+      // The extension detaches after 30 s idle, which ends the frame's session
+      // too; asking for frames again gives the same frame a new one.
+      if (tries || !/session/i.test(e.message)) throw e;
+      f = null;
+    }
+  }
+}
+
+// Remote objects made in a frame live there, so later commands on them
+// (callFunctionOn with an objectId) have to go there too.
+function noteObjects(s, frame, result, depth = 0) {
+  if (!result || typeof result !== 'object' || depth > 4) return;
+  if (typeof result.objectId === 'string') {
+    if (s.objects.size > 5000) s.objects.clear();
+    s.objects.set(result.objectId, frame);
+  }
+  for (const v of Array.isArray(result) ? result : Object.values(result)) noteObjects(s, frame, v, depth + 1);
+}
+
+// Brings a frame on screen, outermost iframe first, so a person watching
+// (or a shot) sees what's clicked. Its clicks don't depend on it: they go to
+// the frame itself (clickNode).
+async function showFrame(tabId, frame) {
+  const owners = [];
+  for (let f = frame; f; f = state(tabId).frames.get(f)?.parent) {
+    const parent = state(tabId).frames.get(f)?.parent || null;
+    const { backendNodeId } = await cdp(tabId, 'DOM.getFrameOwner', { frameId: f }, undefined, parent);
+    owners.unshift(frameNode(parent, backendNodeId));
+  }
+  for (const owner of owners) await cdp(tabId, 'DOM.scrollIntoViewIfNeeded', { backendNodeId: owner }).catch(() => {});
 }
 
 // What went wrong loading a tab's page, if anything, as the extension saw it.
@@ -520,12 +597,14 @@ const pageAnswers = (p, tabId) =>
 // still animating in, a toast or a transparent overlay can sit on top, and a
 // real click then lands on that instead (Sentry's Remove Project dialog, 29 Oct).
 async function hitsTarget(tabId, backendNodeId, at) {
-  const hit = await cdp(tabId, 'DOM.getNodeForLocation', { x: Math.round(at.x), y: Math.round(at.y), ignorePointerEventsNone: true }).catch(() => null);
+  // In a frame, asked of the frame.
+  const { frame, id } = inFrame(backendNodeId) ? splitNode(backendNodeId) : { frame: null, id: backendNodeId };
+  const hit = await cdp(tabId, 'DOM.getNodeForLocation', { x: Math.round(at.x), y: Math.round(at.y), ignorePointerEventsNone: true }, undefined, frame).catch(() => null);
   if (!hit?.backendNodeId) return { ok: false, what: 'nothing' };
-  if (hit.backendNodeId === backendNodeId) return { ok: true };
+  if (hit.backendNodeId === id) return { ok: true };
   const [{ object: target }, { object: top }] = await Promise.all([
     cdp(tabId, 'DOM.resolveNode', { backendNodeId }),
-    cdp(tabId, 'DOM.resolveNode', { backendNodeId: hit.backendNodeId }),
+    cdp(tabId, 'DOM.resolveNode', { backendNodeId: frameNode(frame, hit.backendNodeId) }),
   ]);
   const { result } = await cdp(tabId, 'Runtime.callFunctionOn', {
     objectId: target.objectId,
@@ -570,26 +649,53 @@ const dialogLine = (tabId, d) => `[js ${d.type} "${d.message}" is open; nothing 
 
 // Every <input type=file> in the page, keyed by backendNodeId. Hidden ones
 // aren't in the accessibility tree, and they're the ones upload needs.
-async function fileInputs(tabId) {
+// In a cross-origin iframe too (frame), keyed by its own backend ids.
+async function fileInputs(tabId, frame = null, timeoutMs = CDP_WAIT_MS) {
   try {
-    const { root } = await cdp(tabId, 'DOM.getDocument', { depth: 0 });
-    const { nodeIds } = await cdp(tabId, 'DOM.querySelectorAll', { nodeId: root.nodeId, selector: 'input[type=file]' });
+    const { root } = await cdp(tabId, 'DOM.getDocument', { depth: 0 }, timeoutMs, frame);
+    const { nodeIds } = await cdp(tabId, 'DOM.querySelectorAll', { nodeId: root.nodeId, selector: 'input[type=file]' }, timeoutMs, frame);
     if (!nodeIds.length) return new Map();
     // A styled <label> isn't a control in the tree, so its text is the only
     // name the input has. Same order as querySelectorAll above.
-    const [nodes, labels] = await Promise.all([
-      Promise.all(nodeIds.map((nodeId) => cdp(tabId, 'DOM.describeNode', { nodeId }).then((r) => r.node))),
-      evaluate(tabId, `[...document.querySelectorAll('input[type=file]')].map((i) => i.labels?.[0]?.innerText || i.getAttribute('aria-label') || i.title || '')`).catch(() => []),
+    const [nodes, names] = await Promise.all([
+      Promise.all(nodeIds.map((nodeId) => cdp(tabId, 'DOM.describeNode', { nodeId }, timeoutMs, frame).then((r) => r.node))),
+      cdp(tabId, 'Runtime.evaluate', { expression: `${FILE_INPUTS}.map(${FILE_LABEL})`, returnByValue: true }, timeoutMs, frame).then((r) => r.result?.value || [], () => []),
     ]);
-    return new Map(
-      nodes.map((n, i) => {
-        const a = {};
-        for (let j = 0; j < (n.attributes?.length || 0); j += 2) a[n.attributes[j]] = n.attributes[j + 1];
-        return [n.backendNodeId, { id: a.id, label: labels[i], accept: a.accept, multiple: 'multiple' in a, disabled: 'disabled' in a }];
-      }),
-    );
+    return fileInfo(nodes, names);
   } catch {
     return new Map(); // a snapshot without them beats no snapshot
+  }
+}
+
+const FILE_INPUTS = `[...document.querySelectorAll('input[type=file]')]`;
+const FILE_LABEL = `(i) => i.labels?.[0]?.innerText || i.getAttribute('aria-label') || i.title || ''`;
+
+function fileInfo(nodes, names) {
+  return new Map(
+    nodes.map((n, i) => {
+      const a = {};
+      for (let j = 0; j < (n.attributes?.length || 0); j += 2) a[n.attributes[j]] = n.attributes[j + 1];
+      return [n.backendNodeId, { id: a.id, label: names[i], accept: a.accept, multiple: 'multiple' in a, disabled: 'disabled' in a }];
+    }),
+  );
+}
+
+// The same for a frame that shares its parent's process (documents()), whose
+// document the DOM domain's querySelectorAll can't be pointed at, so the
+// inputs are found in an isolated world made in it.
+async function inProcessFileInputs(tabId, id, doc) {
+  try {
+    const arr = (await evalIn(tabId, id, doc, FILE_INPUTS, { byValue: false })).result?.objectId;
+    if (!arr) return new Map();
+    const [{ result: props }, names] = await Promise.all([
+      cdp(tabId, 'Runtime.getProperties', { objectId: arr, ownProperties: true }, PROBE_MS, doc.session),
+      cdp(tabId, 'Runtime.callFunctionOn', { objectId: arr, functionDeclaration: `function () { return this.map(${FILE_LABEL}); }`, returnByValue: true }, PROBE_MS, doc.session).then((r) => r.result?.value || [], () => []),
+    ]);
+    const els = props.filter((p) => /^\d+$/.test(p.name)).sort((a, b) => a.name - b.name);
+    const nodes = await Promise.all(els.map((p) => cdp(tabId, 'DOM.describeNode', { objectId: p.value.objectId }, PROBE_MS, doc.session).then((r) => r.node)));
+    return fileInfo(nodes, names);
+  } catch {
+    return new Map();
   }
 }
 
@@ -639,14 +745,87 @@ async function drawn(tabId) {
   await evaluate(tabId, DRAWN).catch(() => {});
 }
 
+// Every iframe in the tab, by frame id: { session, parent, url, inProcess }.
+// session is the cross-origin frame whose debugger session reaches it (null
+// for the tab's own); parent is the frame it sits in (null for the page).
+// Cross-origin isn't always another process: a frame from the same site on
+// another port shares the page's, gets no session of its own, and the page's
+// accessibility tree leaves it out all the same, so each session's frame tree
+// is walked for those too.
+async function documents(tabId) {
+  const oopifs = await loadFrames(tabId);
+  const docs = new Map([...oopifs].map(([id, f]) => [id, { session: id, parent: f.parent, url: f.url, inProcess: false }]));
+  const walk = (node, parent, session) => {
+    for (const child of node.childFrames || []) {
+      const id = child.frame.id;
+      // Its own session walks what's inside it.
+      if (oopifs.has(id)) docs.get(id).parent = parent;
+      else {
+        docs.set(id, { session, parent, url: child.frame.url, inProcess: true });
+        walk(child, id, session);
+      }
+    }
+  };
+  await Promise.all(
+    [null, ...oopifs.keys()].map(async (session) => {
+      const tree = await cdp(tabId, 'Page.getFrameTree', {}, PROBE_MS, session).then((r) => r.frameTree, () => null);
+      if (tree) walk(tree, session, session);
+    }),
+  );
+  return docs;
+}
+
+// Evaluates in one of documents()'s frames. One that shares a process with
+// its parent is reached through an isolated world made in it.
+async function evalIn(tabId, id, doc, expression, { timeoutMs = PROBE_MS, byValue = true } = {}) {
+  if (!doc.inProcess) return cdp(tabId, 'Runtime.evaluate', { expression, returnByValue: byValue }, timeoutMs, id);
+  const { executionContextId } = await cdp(tabId, 'Page.createIsolatedWorld', { frameId: id, worldName: 'browserbear' }, timeoutMs, doc.session);
+  return cdp(tabId, 'Runtime.evaluate', { expression, returnByValue: byValue, contextId: executionContextId }, timeoutMs, doc.session);
+}
+
+// The accessibility tree of each iframe, which element in its parent holds
+// it, and a cross-origin one's file inputs.
+async function frameTrees(tabId) {
+  const docs = await documents(tabId);
+  // A frame sharing the page's process has session null, which is the tab's.
+  const sessionOf = (id) => (id === null ? null : docs.has(id) ? docs.get(id).session : id);
+  await Promise.all(
+    [...docs].map(async ([id, d]) => {
+      // A short wait: one stuck ad frame mustn't hold up a look at the page.
+      [d.nodes, d.owner, d.files] = await Promise.all([
+        cdp(tabId, 'Accessibility.getFullAXTree', d.inProcess ? { frameId: id } : {}, PROBE_MS, d.session).then((r) => r.nodes, () => null),
+        cdp(tabId, 'DOM.getFrameOwner', { frameId: id }, PROBE_MS, sessionOf(d.parent)).then((r) => r.backendNodeId, () => null),
+        d.inProcess ? inProcessFileInputs(tabId, id, d) : fileInputs(tabId, id, PROBE_MS),
+      ]);
+    }),
+  );
+  return docs;
+}
+
 async function snapshot(tabId, { full = false } = {}) {
   const s = state(tabId);
   // A JS dialog freezes the page, so every other call would just time out.
   if (s.dialog) return `tab ${tabId}\n${dialogLine(tabId, s.dialog)}`;
   await wake(tabId);
   await cdp(tabId, 'Page.enable');
-  const [{ nodes }, files] = await Promise.all([cdp(tabId, 'Accessibility.getFullAXTree'), fileInputs(tabId)]);
-  const lines = compact(nodes, s.refs, files, (await stillFilled(tabId)) || undefined);
+  const [{ nodes }, files, frames] = await Promise.all([cdp(tabId, 'Accessibility.getFullAXTree'), fileInputs(tabId), frameTrees(tabId)]);
+  const masked = (await stillFilled(tabId)) || undefined;
+  // Each cross-origin iframe's controls go where the iframe is in its parent,
+  // numbered from the same refs as the page's own.
+  // A frame sharing the page's process has the page's node ids, so the page's
+  // refs; one in its own process has its session's.
+  const linesFor = (frame, axNodes) => {
+    const inline = new Map();
+    for (const [id, f] of frames) {
+      if (f.parent !== frame || !f.nodes) continue;
+      const inner = linesFor(id, f.nodes);
+      if (inner.length) inline.set(f.owner ?? `unplaced ${id}`, [`[frame ${hostOf(f.url) || f.url}]`, ...inner]);
+    }
+    const session = frame && frames.get(frame).session;
+    const refs = session ? { ref: (id) => s.refs.ref(frameNode(session, id)) } : s.refs;
+    return compact(axNodes, refs, frame ? frames.get(frame).files : files, frame ? undefined : masked, inline);
+  };
+  const lines = linesFor(null, nodes);
   const out = full ? { full: true, text: lines.join('\n') } : diff(s.last, lines);
   s.last = lines;
   const tab = (await call(await ownerOf(tabId), 'tabs')).find((t) => t.tabId === tabId);
@@ -744,7 +923,9 @@ async function orClosed(tabId, act) {
   }
 }
 
+// In a cross-origin frame, the point is from the frame's own corner.
 async function center(tabId, backendNodeId) {
+  if (inFrame(backendNodeId)) await showFrame(tabId, splitNode(backendNodeId).frame).catch(() => {});
   await cdp(tabId, 'DOM.scrollIntoViewIfNeeded', { backendNodeId }).catch(() => {});
   const { quads } = await cdp(tabId, 'DOM.getContentQuads', { backendNodeId });
   if (!quads?.length) return null;
@@ -783,8 +964,13 @@ async function clickNode(tabId, backendNodeId, { script = false, sending = () =>
   // already moves the pointer there.
   sending();
   try {
-    await cdp(tabId, 'Input.dispatchMouseEvent', { ...base, type: 'mousePressed' }, INPUT_WAIT_MS);
-    await cdp(tabId, 'Input.dispatchMouseEvent', { ...base, type: 'mouseReleased' }, INPUT_WAIT_MS);
+    // A cross-origin frame gets its clicks itself, at its own coordinates. Sent
+    // to the tab at page coordinates, Chrome sometimes still had the frame where
+    // it was before a scroll and gave the click to the page under it, even with
+    // a mouseMoved first (Chrome for Testing, 10 Nov); sent to the frame, never.
+    const frame = inFrame(backendNodeId) ? splitNode(backendNodeId).frame : null;
+    await cdp(tabId, 'Input.dispatchMouseEvent', { ...base, type: 'mousePressed' }, INPUT_WAIT_MS, frame);
+    await cdp(tabId, 'Input.dispatchMouseEvent', { ...base, type: 'mouseReleased' }, INPUT_WAIT_MS, frame);
   } catch (e) {
     if (!/timed out/.test(e.message)) throw e;
     return `(the page hadn't confirmed the click after ${INPUT_WAIT_MS / 1000} s, so it's busy; the click has probably landed, check below before retrying)`;
@@ -998,8 +1184,29 @@ const FIELD = `
   if (!editable(field)) return null;
   while (field.isContentEditable && field.parentElement?.isContentEditable) field = field.parentElement;`;
 
+// The document focus is in, for type with no ref. FIELD follows focus into
+// same-origin frames by itself; a cross-origin one shows only as an <iframe>
+// whose document is shut, so it's found by asking each frame (Google payments'
+// identity form, 10 Nov: type - said "(no change)").
+async function focusedDocument(tabId) {
+  const shut = await evaluate(tabId, `(() => {
+    let f = document.activeElement;
+    while (f?.shadowRoot?.activeElement || f?.contentDocument?.activeElement) f = f.shadowRoot?.activeElement || f.contentDocument.activeElement;
+    return f?.tagName === 'IFRAME' && !f.contentDocument;
+  })()`).catch(() => false);
+  if (shut) {
+    const docs = await documents(tabId);
+    const focused = new Set();
+    await Promise.all([...docs].map(([id, d]) => evalIn(tabId, id, d, 'document.hasFocus()').then((r) => r.result?.value === true && focused.add(id), () => {})));
+    // A frame's parents say they have focus too; the one wanted is innermost.
+    const id = [...focused].find((f) => ![...focused].some((other) => docs.get(other).parent === f));
+    if (id) return (await evalIn(tabId, id, docs.get(id), 'document.documentElement', { timeoutMs: CDP_WAIT_MS, byValue: false })).result;
+  }
+  return (await cdp(tabId, 'Runtime.evaluate', { expression: 'document.documentElement' })).result;
+}
+
 async function onField(tabId, node, body) {
-  const target = node ? (await cdp(tabId, 'DOM.resolveNode', { backendNodeId: node })).object : (await cdp(tabId, 'Runtime.evaluate', { expression: 'document.documentElement' })).result;
+  const target = node ? (await cdp(tabId, 'DOM.resolveNode', { backendNodeId: node })).object : await focusedDocument(tabId);
   const { result } = await cdp(tabId, 'Runtime.callFunctionOn', { objectId: target.objectId, functionDeclaration: `function () {${FIELD}${body}}`, returnByValue: true });
   return result?.value ?? null;
 }
@@ -1015,7 +1222,7 @@ const READ_FIELD = `return { value: field.value ?? field.innerText, rich: field.
 // The element itself, held on to: a code box can move focus on as soon as it has
 // a digit, and the next box being empty doesn't mean the digit was ignored.
 async function pinField(tabId, node) {
-  const target = node ? (await cdp(tabId, 'DOM.resolveNode', { backendNodeId: node })).object : (await cdp(tabId, 'Runtime.evaluate', { expression: 'document.documentElement' })).result;
+  const target = node ? (await cdp(tabId, 'DOM.resolveNode', { backendNodeId: node })).object : await focusedDocument(tabId);
   const { result } = await cdp(tabId, 'Runtime.callFunctionOn', { objectId: target.objectId, functionDeclaration: `function () {${FIELD} return field;}` });
   return result?.objectId || null;
 }
@@ -1649,6 +1856,13 @@ const commands = {
       text = await evaluate(tab, 'document.body?.innerText ?? null').catch(unlessRefused);
     }
     if (typeof text !== 'string') throw new Error(`tab ${tab} has no page to read yet; try again in a moment`);
+    // innerText stops at an iframe, so each one is read by itself (a
+    // same-origin one too, which the page's innerText doesn't include either).
+    const frames = [...(await documents(tab))];
+    const inner = await Promise.all(frames.map(([id, d]) => evalIn(tab, id, d, 'document.body?.innerText ?? ""').then((r) => r.result?.value, () => '')));
+    frames.forEach(([, f], i) => {
+      if (typeof inner[i] === 'string' && inner[i].trim()) text += `\n\n[frame ${hostOf(f.url) || f.url}]\n${inner[i]}`;
+    });
     if (text.length <= max) return text;
     const file = path.join(OUT, `tab-${tab}-${Date.now()}.txt`);
     fs.writeFileSync(file, text, { mode: 0o600 });
