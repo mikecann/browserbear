@@ -81,5 +81,12 @@ test('a stuck tab says why, and a link that ignores a real click gets a script o
   const started = Date.now();
   await assert.rejects(browserbear('snap', '1'), new RegExp(`page isn't answering.*browserbear open ${url}`));
   assert.ok(Date.now() - started < 6000, `took ${Date.now() - started} ms`);
+  // read and goto stop at it too, rather than keep asking: read on a dead tab
+  // in the agents' browser took 1 min 45 s to give up (12 Nov 2026).
+  for (const args of [['read', '1'], ['goto', '1', url]]) {
+    const at = Date.now();
+    await assert.rejects(browserbear(...args), /page isn't answering/);
+    assert.ok(Date.now() - at < 6000, `${args[0]} took ${Date.now() - at} ms`);
+  }
   assert.deepEqual(detaches, [1, 1]);
 });

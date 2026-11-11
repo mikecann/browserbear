@@ -94,10 +94,60 @@ async function runningApp(url) {
     const pid = info?.result?.processInfo?.find((p) => p.type === 'browser')?.id;
     if (!pid) return { sock, path: null };
     const { execFileSync } = await import('node:child_process');
-    return { sock, path: execFileSync('/bin/ps', ['-o', 'comm=', '-p', String(pid)]).toString().trim() };
+    return { sock, pid, path: execFileSync('/bin/ps', ['-o', 'comm=', '-p', String(pid)]).toString().trim() };
   } catch {
     sock.close();
     return { sock: null, path: null };
+  }
+}
+
+// The browser updates itself on disk while it runs, and the running copy then
+// can't start any new page: its helper app went with the old version's folder.
+// Every new tab stays an empty shell with no URL, and every command to it times
+// out (Helium 156 to 157 on 11 Nov 2026, with Page.enable timing out on each
+// open). Chrome would say "relaunch to update"; nobody sees that here, so this
+// compares the version running with the one now on disk.
+function versionOnDisk(exe) {
+  const app = exe?.match(/^(.*?\.app)\//)?.[1] || (APP.includes('/') ? APP : `/Applications/${APP}.app`);
+  try {
+    const frameworks = path.join(app, 'Contents', 'Frameworks');
+    const fw = fs.readdirSync(frameworks).find((f) => f.endsWith('.framework') && fs.existsSync(path.join(frameworks, f, 'Versions', 'Current')));
+    return fw ? fs.readlinkSync(path.join(frameworks, fw, 'Versions', 'Current')) : null;
+  } catch {
+    return null;
+  }
+}
+async function runningVersion() {
+  const r = await fetch(`http://127.0.0.1:${PORT}/json/version`).catch(() => null);
+  return r?.ok ? (await r.json()).Browser?.split('/')[1] ?? null : null;
+}
+let browserExe = null;
+async function updatedUnderneath() {
+  const [running, disk] = [await runningVersion(), versionOnDisk(browserExe)];
+  return running && disk && running !== disk ? { running, disk } : null;
+}
+
+// Asks the browser to quit, and if it won't, ends it: a copy that updated
+// itself underneath ignored Browser.close (Helium, 12 Nov 2026). Only ever a
+// process running our own profile folder, never one of Mike's browsers.
+async function closeBrowser(askToClose, pid) {
+  askToClose();
+  for (let i = 0; i < 25 && (await browserWsUrl()); i++) await sleep(200);
+  if (!(await browserWsUrl()) || !pid) return;
+  const { execFileSync } = await import('node:child_process');
+  let args = '';
+  try {
+    args = execFileSync('/bin/ps', ['-o', 'args=', '-p', String(pid)]).toString();
+  } catch {}
+  // The whole value, up to the next switch: not ${PROFILE}-something else.
+  if (!` ${args.trim()} `.includes(` --user-data-dir=${PROFILE} `)) return;
+  log("it didn't quit; ending it, pid", pid);
+  for (const signal of ['SIGTERM', 'SIGKILL']) {
+    try {
+      process.kill(pid, signal);
+    } catch {}
+    for (let i = 0; i < 25 && (await browserWsUrl()); i++) await sleep(200);
+    if (!(await browserWsUrl())) return;
   }
 }
 
@@ -109,13 +159,15 @@ async function ensureChrome() {
     // Another browser on our port: the agents' old Google Chrome from before
     // Helium (8 Nov 2026), say. Close it and start the right one, or agents
     // would carry on in it under Helium's name.
-    const { sock, path: exe } = await runningApp(url);
-    if (isOurApp(exe)) { sock?.close(); return url; }
+    const { sock, pid, path: exe } = await runningApp(url);
+    browserExe = exe;
+    const stale = isOurApp(exe) && (await updatedUnderneath());
+    if (isOurApp(exe) && !stale) { sock?.close(); return url; }
+    if (stale) log(`${BROWSER_NAME} ${stale.running} is running but ${stale.disk} is on disk, so it can't start new pages; restarting it`);
     log('closing', exe, 'on our port, to start', APP);
-    sock.send(JSON.stringify({ id: 2, method: 'Browser.close' }));
-    for (let i = 0; i < 50 && (await browserWsUrl()); i++) await sleep(200);
+    await closeBrowser(() => sock.send(JSON.stringify({ id: 2, method: 'Browser.close' })), stale ? pid : null);
     sock.close();
-    if (await browserWsUrl()) throw new Error(`another browser (${exe}) is on the agents' port ${PORT} and didn't close`);
+    if (await browserWsUrl()) throw new Error(stale ? `the agents' browser (${BROWSER_NAME}) updated itself and wouldn't quit to restart; quit it and try again` : `another browser (${exe}) is on the agents' port ${PORT} and didn't close`);
     url = null;
   }
   log('starting', APP);
@@ -130,6 +182,7 @@ async function ensureChrome() {
 }
 
 let ws;
+let restarting = false;
 let nextCdp = 1;
 const cdpWaiting = new Map();
 const sessions = new Map(); // targetId -> sessionId
@@ -153,7 +206,7 @@ function browserCall(method, params = {}, sessionId, timeoutMs = 30_000) {
 
 async function connectChrome() {
   const url = await ensureChrome();
-  ws = new WebSocket(url);
+  const mine = (ws = new WebSocket(url));
   await new Promise((resolve, reject) => {
     ws.onopen = resolve;
     ws.onerror = () => reject(new Error("couldn't connect to the agent's Chrome"));
@@ -171,8 +224,9 @@ async function connectChrome() {
     if (m.method) onEvent(m);
   };
   // Chrome was quit (by Mike, or crashed): the service sees us go, and the
-  // next `--profile agent` starts us again.
+  // next `--profile agent` starts us again. Unless we closed it to restart it.
   ws.onclose = () => {
+    if (restarting || ws !== mine) return;
     log('Chrome went away');
     process.exit(0);
   };
@@ -269,14 +323,23 @@ function writeState() {
   }, 50);
 }
 
-async function sessionFor(tab) {
+async function sessionFor(tab, enableTimeoutMs = 30_000) {
   const have = sessions.get(tab.targetId);
   if (have) return have;
   const { sessionId } = await browserCall('Target.attachToTarget', { targetId: tab.targetId, flatten: true });
   sessions.set(tab.targetId, sessionId);
   sessionTarget.set(sessionId, tab.targetId);
   tab.autoAttached = false;
-  await browserCall('Page.enable', {}, sessionId);
+  try {
+    await browserCall('Page.enable', {}, sessionId, enableTimeoutMs);
+  } catch (e) {
+    // Not kept, so the next command attaches afresh rather than reuse a
+    // session that never got going.
+    sessions.delete(tab.targetId);
+    sessionTarget.delete(sessionId);
+    browserCall('Target.detachFromTarget', { sessionId }, undefined, 5_000).catch(() => {});
+    throw e;
+  }
   // So the page behaves as if it's in front when its window is behind others.
   await browserCall('Emulation.setFocusEmulationEnabled', { enabled: true }, sessionId).catch(() => {});
   const tree = await browserCall('Page.getFrameTree', {}, sessionId).catch(() => null);
@@ -311,8 +374,8 @@ function loaded(tab, timeoutMs = 25_000) {
   });
 }
 
-async function goTo(tab, url) {
-  const session = await sessionFor(tab);
+async function goTo(tab, url, enableTimeoutMs) {
+  const session = await sessionFor(tab, enableTimeoutMs);
   tab.status = 'loading';
   tab.loadError = undefined;
   const r = await browserCall('Page.navigate', { url }, session, 40_000);
@@ -398,12 +461,28 @@ const ops = {
 
   // One window per tab: a tab behind another in the same window stops drawing.
   // background: behind Mike's windows, without taking his focus.
+  // A blank tab that doesn't answer in a few seconds never will: it's closed,
+  // not left behind as an empty tab with no id given back, and a fresh one is
+  // tried, after restarting the browser if it updated itself underneath us.
   async open({ url, thread }) {
-    const { targetId } = await browserCall('Target.createTarget', { url: 'about:blank', newWindow: true, background: true, width: WIDTH, height: HEIGHT });
-    const { targetInfos } = await browserCall('Target.getTargets');
-    const tab = track(targetInfos.find((t) => t.targetId === targetId));
-    own(tab, thread);
-    writeState();
+    if (await updatedUnderneath()) await restartBrowser();
+    let tab;
+    for (let attempt = 0; ; attempt++) {
+      const { targetId } = await browserCall('Target.createTarget', { url: 'about:blank', newWindow: true, background: true, width: WIDTH, height: HEIGHT });
+      const { targetInfos } = await browserCall('Target.getTargets');
+      tab = track(targetInfos.find((t) => t.targetId === targetId));
+      own(tab, thread);
+      writeState();
+      try {
+        await sessionFor(tab, BLANK_ANSWERS_MS);
+        break;
+      } catch (e) {
+        log('new tab', tab.tabId, "didn't answer:", e.message);
+        await browserCall('Target.closeTarget', { targetId }, undefined, 5_000).catch(() => {});
+        if (attempt === 1) throw new Error(`the agents' browser (${BROWSER_NAME}) opens tabs but can't load a page in them (${e.message}). Quit ${BROWSER_NAME} (the agents' copy) and try again; it starts by itself`);
+        if (attempt === 0 && (await updatedUnderneath())) await restartBrowser();
+      }
+    }
     await goTo(tab, url);
     writeState();
     return tabInfo(tab);
@@ -504,6 +583,43 @@ const ops = {
   },
 };
 
+const BLANK_ANSWERS_MS = 8_000;
+
+// Closes the browser and starts it again, for one that updated itself on disk.
+// Its tabs go with it: none of them could load a new page anyway. One restart
+// at a time: two opens that both see the update share it. If it fails, the
+// host goes, so the service sees it gone and the next command starts it afresh
+// rather than talk to a browser that isn't there.
+let restartingNow = null;
+function restartBrowser() {
+  restartingNow ||= doRestart()
+    .catch((e) => {
+      log('restart failed:', e.message);
+      process.exit(1);
+    })
+    .finally(() => { restartingNow = null; });
+  return restartingNow;
+}
+async function doRestart() {
+  restarting = true;
+  try {
+    log('restarting', BROWSER_NAME);
+    // Not waited on: it may never answer before the connection goes.
+    await closeBrowser(() => ws.send(JSON.stringify({ id: nextCdp++, method: 'Browser.close' })), chromePid);
+    for (const w of cdpWaiting.values()) { clearTimeout(w.timer); w.reject(new Error(`${BROWSER_NAME} restarted`)); }
+    cdpWaiting.clear();
+    for (const m of [known, byTarget, sessions, sessionTarget, frameSessions]) m.clear();
+    await connectChrome();
+    chromePid = await browserPid();
+    (await browserCall('Target.getTargets')).targetInfos.forEach(track);
+    writeState();
+  } finally {
+    restarting = false;
+  }
+}
+
+const browserPid = async () => (await browserCall('SystemInfo.getProcessInfo').catch(() => null))?.processInfo?.find((p) => p.type === 'browser')?.id ?? null;
+
 // ---- The service ----
 
 let sock = null;
@@ -538,9 +654,17 @@ function connectService(delay = 0) {
 }
 
 log('host up', os.hostname());
-await connectChrome();
+// Said in the log, which is where the service's error points.
+process.on('uncaughtException', (e) => {
+  log('failed:', e?.stack || e);
+  process.exit(1);
+});
+await connectChrome().catch((e) => {
+  log('failed to start:', e.message);
+  process.exit(1);
+});
 // For Threadbear, to hand the focus back when a page's popup takes it.
-chromePid = (await browserCall('SystemInfo.getProcessInfo').catch(() => null))?.processInfo?.find((p) => p.type === 'browser')?.id ?? null;
+chromePid = await browserPid();
 const { targetInfos } = await browserCall('Target.getTargets');
 targetInfos.forEach(track);
 writeState();

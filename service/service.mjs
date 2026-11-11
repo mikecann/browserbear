@@ -235,7 +235,9 @@ function startAgentChrome() {
   agentChrome ||= (async () => {
     const host = path.join(path.dirname(fileURLToPath(import.meta.url)), '..', 'agent', 'agent-host.mjs');
     spawn(process.execPath, [host], { detached: true, stdio: 'ignore', cwd: HOME }).unref();
-    for (let i = 0; i < 150 && !profiles.has('agent-chrome'); i++) await sleep(100);
+    // 40 s: the host may first have to end a browser that updated itself
+    // underneath it and won't quit, then start it again (agent/agent-host.mjs).
+    for (let i = 0; i < 400 && !profiles.has('agent-chrome'); i++) await sleep(100);
     agentChrome = null;
     if (!profiles.has('agent-chrome')) throw new Error("the agent's Chrome didn't start; see agent/host.log in BrowserBear's folder");
   })();
@@ -243,6 +245,7 @@ function startAgentChrome() {
 }
 
 const opening = new Map(); // what was asked for -> the profile it's opening
+const OPEN_OP_MS = 100_000;
 const OPEN_WAIT_MS = Number(process.env.BROWSERBEAR_OPEN_WAIT_MS) || 20_000;
 const noBear = new Map(); // email or menu name -> when it was opened and nothing connected
 const NO_BEAR_MS = 10 * 60_000;
@@ -566,27 +569,38 @@ async function unstick(p, tabId, method, params, e) {
     const url = nav.entries[nav.currentIndex]?.url || '';
     state(tabId).stuck = { url };
     log('page stuck', tabId, method);
-    throw new Error(stuckPage(tabId, url));
+    throw stuckError(tabId, url);
   }
   log('session stuck', tabId, method);
   await call(p, 'detach', { tabId }, PROBE_MS).catch(() => {});
   if (!(await history().catch(() => null))) {
     const url = (await call(p, 'tabs').catch(() => [])).find((t) => t.tabId === tabId)?.url || '';
-    throw new Error(`tab ${tabId}'s debugger session is stuck and starting a fresh one didn't help; reopen the page in a new tab: browserbear open ${url || '<url>'}`);
+    throw Object.assign(new Error(`tab ${tabId}'s debugger session is stuck and starting a fresh one didn't help; reopen the page in a new tab: browserbear open ${url || '<url>'}`), { stuck: true });
   }
   if (LOOKS.test(method)) return call(p, 'cdp', { tabId, method, params }, CDP_WAIT_MS);
   // It may have run before the session stuck, so it isn't sent again.
   throw new Error(`tab ${tabId}'s debugger session was stuck, so BrowserBear started a fresh one; ${method} may or may not have run, snap to see before trying again`);
 }
 
-const stuckPage = (tabId, url) =>
-  `tab ${tabId}'s page isn't answering: Chrome is fine, but the page's own scripts are stuck or flat out (a live chart can do this). Try again in a bit, or open it fresh in a new tab: browserbear open ${url || '<url>'}`;
+// stuck: the waits for a page to load or draw stop at this rather than ask
+// again, since each ask is another 4 s at best: read on a dead tab in the
+// agents' browser took 1 min 45 s to give up (12 Nov 2026).
+const stuckError = (tabId, url) =>
+  Object.assign(
+    new Error(
+      url
+        ? `tab ${tabId}'s page isn't answering: Chrome is fine, but the page's own scripts are stuck or flat out (a live chart can do this). Try again in a bit, or open it fresh in a new tab: browserbear open ${url}`
+        // Never got as far as a page at all: its renderer didn't start.
+        : `tab ${tabId} never got a page to load in, so the browser couldn't start one for it; close it and open the page again in a new tab: browserbear close ${tabId}; browserbear open <url>`,
+    ),
+    { stuck: true },
+  );
 
 // Once a page has been stuck, a quick look first, so each command after it
 // doesn't wait the full 20 s to say the same thing.
 async function stillStuck(p, tabId) {
   const s = state(tabId);
-  if (!(await pageAnswers(p, tabId))) throw new Error(stuckPage(tabId, s.stuck.url));
+  if (!(await pageAnswers(p, tabId))) throw stuckError(tabId, s.stuck.url);
   s.stuck = null;
 }
 
@@ -710,7 +724,7 @@ async function inProcessFileInputs(tabId, id, doc) {
 // could, say, mark your messages read.
 async function wake(tabId) {
   if (state(tabId).dialog) return;
-  const visibility = await evaluate(tabId, 'document.visibilityState').catch(() => null);
+  const visibility = await evaluate(tabId, 'document.visibilityState').catch(unlessStuck);
   if (visibility !== 'hidden') return;
   if (!bearTabs.has(tabId)) {
     const tab = (await call(await ownerOf(tabId), 'tabs')).find((t) => t.tabId === tabId);
@@ -742,7 +756,7 @@ const DRAWN = `new Promise((resolve) => {
 })`;
 
 async function drawn(tabId) {
-  await evaluate(tabId, DRAWN).catch(() => {});
+  await evaluate(tabId, DRAWN).catch(unlessStuck);
 }
 
 // Every iframe in the tab, by frame id: { session, parent, url, inProcess }.
@@ -1379,7 +1393,7 @@ async function typeChecked(tabId, node, text) {
   await settle();
   if (!before) return ''; // a canvas editor, say: nothing to read back
   // Gone means the page moved on or redrew the field, which isn't a sign of trouble.
-  const read = () => readPinned(tabId, field).catch(() => null);
+  const read = () => readPinned(tabId, field).catch(unlessStuck);
   let after = await read();
   if (!after) return '';
   // In a rich editor, only the text showing up counts, since a decoration it
@@ -1559,10 +1573,16 @@ async function evaluate(tabId, expression) {
   return r.result.value;
 }
 
-// For the waits on a page to load: a refusal or a closed tab won't get better by
-// trying again.
+// For the waits on a page to load: a refusal, a closed tab or a stuck page
+// won't get better by trying again.
 const unlessRefused = (e) => {
-  if (e.refused || e.closed) throw e;
+  if (e.refused || e.closed || e.stuck) throw e;
+  return null;
+};
+// For the looks that are only nice to have (is it drawn yet?): anything but a
+// stuck page is shrugged off.
+const unlessStuck = (e) => {
+  if (e.stuck) throw e;
   return null;
 };
 
@@ -1682,9 +1702,11 @@ const commands = {
     return out.join('\n');
   },
 
+  // Long enough for the agents' browser to restart itself first, when it has
+  // updated underneath itself (agent/agent-host.mjs).
   async open({ profile, url, thread }) {
     const p = await findProfile(profile);
-    const tab = remember(p.instance, await call(p, 'open', { url, thread }, 40_000));
+    const tab = remember(p.instance, await call(p, 'open', { url, thread }, OPEN_OP_MS));
     panel.remember(tab.tabId, thread, p.instance, true);
     marks.used(tab.tabId, thread, `opening ${hostOf(url)}`);
     bearTabs.add(tab.tabId);
@@ -1877,7 +1899,7 @@ const commands = {
     }
     sent(tab, url);
     // Refused here means it landed on a warning page, explained just below.
-    await waitForReady(tab).catch(() => {});
+    await waitForReady(tab).catch(unlessStuck);
     await wake(tab);
     await drawn(tab);
     const failure = loadFailure((await call(p, 'tabs')).find((t) => t.tabId === tab));
