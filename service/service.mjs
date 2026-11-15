@@ -1181,7 +1181,25 @@ const KEYS = {
   ArrowRight: { code: 'ArrowRight', keyCode: 39 },
   PageDown: { code: 'PageDown', keyCode: 34 },
   PageUp: { code: 'PageUp', keyCode: 33 },
+  Home: { code: 'Home', keyCode: 36 },
+  End: { code: 'End', keyCode: 35 },
+  Insert: { code: 'Insert', keyCode: 45 },
+  Space: { code: 'Space', keyCode: 32, text: ' ' },
+  CapsLock: { code: 'CapsLock', keyCode: 20 },
+  NumLock: { code: 'NumLock', keyCode: 144 },
+  ScrollLock: { code: 'ScrollLock', keyCode: 145 },
+  Pause: { code: 'Pause', keyCode: 19 },
+  PrintScreen: { code: 'PrintScreen', keyCode: 44 },
+  ContextMenu: { code: 'ContextMenu', keyCode: 93 },
+  // A modifier pressed on its own, as some apps want (a double Shift, say).
+  Shift: { code: 'ShiftLeft', keyCode: 16 },
+  Control: { code: 'ControlLeft', keyCode: 17 },
+  Alt: { code: 'AltLeft', keyCode: 18 },
+  Meta: { code: 'MetaLeft', keyCode: 91 },
+  ...Object.fromEntries(Array.from({ length: 12 }, (_, i) => [`F${i + 1}`, { code: `F${i + 1}`, keyCode: 112 + i }])),
 };
+// Names people write for the keys above, so "Esc" doesn't type "Esc".
+const KEY_ALIASES = { Esc: 'Escape', Return: 'Enter', Del: 'Delete', Up: 'ArrowUp', Down: 'ArrowDown', Left: 'ArrowLeft', Right: 'ArrowRight', Cmd: 'Meta', Command: 'Meta', Ctrl: 'Control', Option: 'Alt', Opt: 'Alt' };
 const MODS = { Alt: 1, Control: 2, Meta: 4, Shift: 8 };
 // On macOS, Cmd+A and friends sent over CDP don't reach the editor as
 // shortcuts (tested on X's composer, 29 Oct); Chrome wants the editing
@@ -1191,7 +1209,11 @@ const MAC_COMMANDS = { 'Meta+a': 'selectAll', 'Meta+c': 'copy', 'Meta+x': 'cut',
 // Punctuation's char codes are other keys' key codes: 46, a full stop, is Delete,
 // which a page handling its own keydowns takes at its word.
 const PUNCTUATION = { '.': ['Period', 190], ',': ['Comma', 188], '-': ['Minus', 189], '=': ['Equal', 187], '/': ['Slash', 191], ';': ['Semicolon', 186], "'": ['Quote', 222], '[': ['BracketLeft', 219], ']': ['BracketRight', 221], '\\': ['Backslash', 220], '`': ['Backquote', 192], ' ': ['Space', 32] };
+// The shifted ones, on the key a US keyboard has them on: "+" is Shift and Equal,
+// which a shortcut for Control++ checks for.
+const SHIFTED = { '!': '1', '@': '2', '#': '3', $: '4', '%': '5', '^': '6', '&': '7', '*': '8', '(': '9', ')': '0', _: '-', '+': '=', '{': '[', '}': ']', '|': '\\', ':': ';', '"': "'", '<': ',', '>': '.', '?': '/', '~': '`' };
 function charKey(key) {
+  if (SHIFTED[key]) return { ...charKey(SHIFTED[key]), text: key };
   if (PUNCTUATION[key]) return { code: PUNCTUATION[key][0], keyCode: PUNCTUATION[key][1], text: key };
   if (/^[0-9]$/.test(key)) return { code: `Digit${key}`, keyCode: key.charCodeAt(0), text: key };
   return { code: `Key${key.toUpperCase()}`, keyCode: key.toUpperCase().charCodeAt(0), text: key };
@@ -1200,17 +1222,25 @@ function charKey(key) {
 // "Enter", "Meta+a", "Shift+Tab"
 async function pressKey(tabId, combo) {
   await cdp(tabId, 'Page.enable');
-  const parts = combo.split('+');
-  const key = parts.pop();
-  const modifiers = parts.reduce((m, p) => m | (MODS[p] || 0), 0);
+  // "+" on its own, or as the last key ("Shift++"), is the plus key.
+  const parts = combo.endsWith('++') || combo === '+' ? [...combo.slice(0, -2).split('+').filter(Boolean), '+'] : combo.split('+');
+  const named = parts.map((p) => KEY_ALIASES[p] || p);
+  const key = named.pop();
+  const badMod = named.find((p) => !MODS[p]);
+  if (badMod) throw new Error(`key: ${JSON.stringify(badMod)} in ${JSON.stringify(combo)} isn't a modifier; use Alt, Control, Meta or Shift`);
+  // A name that isn't a key, sent as one, would type its own letters into the
+  // field: "End" put "End" into a Google Sheets cell (16 Nov). So only a single
+  // character is taken as typing.
+  if (!KEYS[key] && [...key].length !== 1) throw new Error(`key: ${JSON.stringify(key)} isn't a key BrowserBear knows. Named keys: ${Object.keys(KEYS).join(', ')}; or a single character, like a or Meta+a. Nothing was pressed`);
+  const modifiers = named.reduce((m, p) => m | MODS[p], 0);
   const k = KEYS[key] || charKey(key);
   const ev = { key, code: k.code, windowsVirtualKeyCode: k.keyCode, nativeVirtualKeyCode: k.keyCode, modifiers };
   // Text only goes with an unmodified key, or Cmd+A would type an "a". Shift+Enter
   // is the exception: without its text Chrome sends the keydown alone, with no
   // keypress or beforeinput (insertLineBreak), so Slate editors like Discord's never
   // saw a line break (2 Nov).
-  const text = !modifiers || combo === 'Shift+Enter' ? k.text : undefined;
-  const commands = MAC_COMMANDS[combo] ? [MAC_COMMANDS[combo]] : undefined;
+  const text = !modifiers || (modifiers === MODS.Shift && key === 'Enter') ? k.text : undefined;
+  const commands = MAC_COMMANDS[[...named, key].join('+')] ? [MAC_COMMANDS[[...named, key].join('+')]] : undefined;
   // The editing command and the text only work on a full keyDown; rawKeyDown ignores them.
   const type = modifiers && !commands && !text ? 'rawKeyDown' : 'keyDown';
   await cdp(tabId, 'Input.dispatchKeyEvent', { ...ev, type, text, commands });
@@ -1368,6 +1398,26 @@ async function typeSplit(tabId, boxes, chars) {
 const bare = (s) => s.toLowerCase().replace(/[^\p{L}\p{N}]/gu, '');
 const shown = (read) => (read.secret ? "something else (a password field, so it isn't shown)" : JSON.stringify(read.value));
 
+// A field with no size is a canvas app's stand-in for the keyboard: Google Sheets
+// keeps its cell editor at top -10000px, 0 wide, until a key press opens the cell.
+// Size, not position: a real field scrolled up out of a box has a rect above the
+// page too, and must keep type's checks. Such
+// an app reads keydowns, and inserted text (which has none) sat in that editor
+// unseen while type said it was in, so Enter left the cell empty (16 Nov).
+const STAND_IN = `function () {
+  const r = this.getBoundingClientRect();
+  return r.width < 1 || r.height < 1;
+}`;
+
+// Real keys, with line breaks inserted, since a key Enter would commit or send.
+async function typeAsKeys(tabId, text) {
+  const lines = text.split('\n');
+  for (const [i, part] of lines.entries()) {
+    if (i) await cdp(tabId, 'Input.insertText', { text: '\n' });
+    if (part) await typeKeys(tabId, part);
+  }
+}
+
 // Plain type's check on what happened. insertText fires the events real typing
 // does, which rich editors listen for and setting .value doesn't fire, but a masked
 // field can do its own typing from keydown and ignore it (the amount on eToro's
@@ -1388,6 +1438,15 @@ const shown = (read) => (read.secret ? "something else (a password field, so it 
 // Multi-line text is left alone: a composer can send on a line break and empty.
 async function typeChecked(tabId, node, text) {
   const field = text && !text.includes('\n') ? await pinField(tabId, node).catch(() => null) : null;
+  const standIn = await pinField(tabId, node)
+    .then((f) => f && cdp(tabId, 'Runtime.callFunctionOn', { objectId: f, functionDeclaration: STAND_IN, returnByValue: true }))
+    .then((r) => r?.result?.value === true, () => false);
+  if (standIn) {
+    await typeAsKeys(tabId, text);
+    await settle();
+    // Nothing to check it against: the app moves its editor, or empties it as it reads.
+    return "(the field is hidden, a canvas app's stand-in for the keyboard as in Google Sheets, so that was real key presses; snap or shot to see it landed)";
+  }
   const before = field && (await watchField(tabId, field, text).catch(() => null));
   await cdp(tabId, 'Input.insertText', { text });
   await settle();

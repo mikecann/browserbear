@@ -75,6 +75,10 @@ browserbear CLI (or Threadbear)
   still had the frame where it was before a scroll and gave the click to the page.
 - `key Shift+Enter` adds a line break in rich editors, and `type` keeps the newlines in
   its text. Neither sends a Discord message; only `Enter` or `--submit` do.
+- `type` into a field that's hidden (no width or height)
+  uses real key presses. That's a canvas app's stand-in for the keyboard: Google Sheets
+  only starts editing a cell on a keydown, which inserted text hasn't got, so the text
+  sat in its hidden cell editor and Enter left the cell empty.
 
 ## The agents' own browser
 

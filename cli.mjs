@@ -22,7 +22,8 @@ const USAGE = `browserbear: let agents use your real Chrome profiles
                                                 (a link that ignores a real click gets one by itself)
   browserbear type <tab> <ref|-> <text> [--submit] [--replace]
                                                 fails if the text does not end up in the field
-  browserbear key <tab> <key>                   Enter, Escape, Tab, Meta+a, Shift+Enter (a line break), ...
+  browserbear key <tab> <key>                   Enter, Escape, Tab, Home, End, F1-F12, Meta+a, Shift+Enter (a line
+                                                break), ... A name it doesn't know is an error, never typed
   browserbear goto <tab> <url>
   browserbear read <tab>                        the page's text
   browserbear shot <tab> [file]                 screenshot, prints the PNG path
