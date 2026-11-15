@@ -541,7 +541,8 @@ async function send(p, tabId, method, params, timeoutMs) {
   const recovery = /^(Page\.(getNavigationHistory|navigate|handleJavaScriptDialog)$|Emulation\.(clearDeviceMetricsOverride|setFocusEmulationEnabled)$|Target\.getTargetInfo$)/.test(method);
   if (state(tabId).stuck && !recovery) await stillStuck(p, tabId);
   try {
-    return await call(p, 'cdp', { tabId, method, params }, timeoutMs);
+    // timeoutMs too, for the agents' browser, whose own wait is otherwise 30 s.
+    return await call(p, 'cdp', { tabId, method, params, timeoutMs }, timeoutMs);
   } catch (e) {
     if (!e.timedOut) throw e;
     return unstick(p, tabId, method, params, e);
@@ -1626,6 +1627,79 @@ async function replaceText(tabId, node, text) {
   throw new Error(`--replace didn't work on tab ${tabId}: the field holds ${shown(read)}, not ${JSON.stringify(text)}. Nothing was submitted. The page may have changed or reformatted it; snap to see`);
 }
 
+// download's chunks: well under Chrome's 64 MB limit on a message to the host
+// once they're base64.
+const DOWNLOAD_CHUNK = 4 * 1024 * 1024;
+
+// Runs in an isolated world in the tab's top frame: the page's origin and
+// cookies, but the browser's own fetch and URL, and globals the page can't
+// see. In the page's own world a site could swap fetch out and hand over
+// bytes of its choosing for another site's URL (Codex review, 16 Nov).
+async function isolatedIn(tab) {
+  const { frameTree } = await cdp(tab, 'Page.getFrameTree');
+  const { executionContextId } = await cdp(tab, 'Page.createIsolatedWorld', { frameId: frameTree.frame.id, worldName: 'browserbear-download' });
+  return async (expression, timeoutMs) => {
+    const r = await cdp(tab, 'Runtime.evaluate', { expression, returnByValue: true, awaitPromise: true, contextId: executionContextId }, timeoutMs);
+    if (r.exceptionDetails) throw new Error(r.exceptionDetails.exception?.description || r.exceptionDetails.text);
+    return r.result.value;
+  };
+}
+
+// The isolated world keeps the bytes until they've all been read. The fetch
+// gets as long as the extension's would.
+async function fetchInPage(run, url) {
+  // Chrome hands back the same isolated world for the same name, so each
+  // download keeps its bytes under a name of its own.
+  const k = JSON.stringify(`download-${Date.now()}-${Math.random().toString(36).slice(2)}`);
+  const f = await run(`(async () => {
+    const r = await fetch(${JSON.stringify(url)}, { credentials: 'include' });
+    if (!r.ok) throw new Error('HTTP ' + r.status + ' ' + r.statusText + ' from ' + (r.url || ${JSON.stringify(url)}));
+    const bytes = (globalThis[${k}] = new Uint8Array(await r.arrayBuffer()));
+    return { size: bytes.length, type: r.headers.get('content-type'), disposition: r.headers.get('content-disposition'), url: r.url };
+  })()`, 130_000);
+  const chunk = (offset, length) =>
+    run(`(() => {
+      const all = globalThis[${k}];
+      if (!all) throw new Error('the page lost the download (did it navigate?)');
+      const bytes = all.subarray(${offset}, ${offset} + ${length});
+      if (${offset} + ${length} >= all.length) delete globalThis[${k}];
+      let bin = '';
+      for (let i = 0; i < bytes.length; i += 0x8000) bin += String.fromCharCode.apply(null, bytes.subarray(i, i + 0x8000));
+      return btoa(bin);
+    })()`);
+  return { ...f, chunk };
+}
+
+// The name the agent gave, else the server's (Content-Disposition), else the
+// URL's last part. Only ever a bare name, so it can't climb out of the folder.
+function fileNameFor(given, disposition, url) {
+  let name = given;
+  if (!name && disposition) {
+    const star = disposition.match(/filename\*\s*=\s*([^']*)'[^']*'([^;]+)/i);
+    const plain = disposition.match(/filename\s*=\s*"([^"]*)"|filename\s*=\s*([^;]+)/i);
+    try {
+      name = star ? decodeURIComponent(star[2].trim()) : plain && (plain[1] ?? plain[2].trim());
+    } catch {
+      name = plain && (plain[1] ?? plain[2].trim());
+    }
+  }
+  if (!name) {
+    try {
+      name = decodeURIComponent(new URL(url).pathname.split('/').pop());
+    } catch {}
+  }
+  name = String(name || '').split(/[\\/]/).pop().replace(/[\x00-\x1f:]/g, '_').trim();
+  if (!name || name === '.' || name === '..') return 'download';
+  // macOS takes 255 bytes a name; keep the extension when cutting it down.
+  if (Buffer.byteLength(name) > 200) {
+    const ext = path.extname(name).slice(0, 20);
+    let stem = name.slice(0, name.length - ext.length);
+    while (Buffer.byteLength(stem + ext) > 200) stem = [...stem].slice(0, -1).join('');
+    name = stem + ext;
+  }
+  return name;
+}
+
 async function evaluate(tabId, expression) {
   const r = await cdp(tabId, 'Runtime.evaluate', { expression, returnByValue: true, awaitPromise: true });
   if (r.exceptionDetails) throw new Error(r.exceptionDetails.exception?.description || r.exceptionDetails.text);
@@ -2027,9 +2101,40 @@ const commands = {
     return `${note}\n${await snapshot(tab)}`;
   },
 
+  // Saves the file into BrowserBear's own folder, never ~/Downloads: macOS
+  // keeps agents out of that, so a path there was no use to them.
   async download({ tab, url, filename }) {
+    if (!url) throw new Error('say which URL to download');
     const p = await ownerOf(tab);
-    return call(p, 'download', { url, filename }, 130_000);
+    let run;
+    const isolated = async () => (run ||= await isolatedIn(tab));
+    // A relative link is relative to the page it's on.
+    if (!/^[a-z][a-z0-9+.-]*:/i.test(url)) url = await (await isolated())(`new URL(${JSON.stringify(url)}, document.baseURI).href`);
+    let got;
+    try {
+      const f = await call(p, 'fetchFile', { url }, 130_000);
+      got = { ...f, chunk: (offset, length) => call(p, 'fetchChunk', { id: f.id, offset, length }, 60_000) };
+    } catch (e) {
+      // The agents' browser has no fetchFile, nor has an extension that
+      // hasn't reloaded since it came in: fetch from inside the page instead,
+      // which has the page's cookies but not a way round CORS.
+      if (!/unknown op fetchFile/.test(e.message)) throw e;
+      got = await fetchInPage(await isolated(), url);
+    }
+    const name = fileNameFor(filename, got.disposition, got.url || url);
+    // A folder of its own each time, so two downloads of one name can't meet.
+    fs.mkdirSync(path.join(OUT, 'downloads'), { recursive: true, mode: 0o700 });
+    const dir = fs.mkdtempSync(path.join(OUT, 'downloads', `${Date.now()}-${tab}-`));
+    const file = path.join(dir, name);
+    const fd = fs.openSync(file, 'wx', 0o600);
+    try {
+      for (let offset = 0; offset < got.size; offset += DOWNLOAD_CHUNK) {
+        fs.writeSync(fd, Buffer.from(await got.chunk(offset, DOWNLOAD_CHUNK), 'base64'));
+      }
+    } finally {
+      fs.closeSync(fd);
+    }
+    return { path: file, bytes: got.size, type: got.type || null };
   },
 
   async dialog({ tab, action, text }) {

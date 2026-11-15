@@ -6,7 +6,7 @@
 //  - says hello with the profile's signed-in account, so agents can ask for
 //    "Work" instead of a number that changes between connects,
 //  - runs a handful of ops: list/open/close tabs, raw CDP through
-//    chrome.debugger, downloads,
+//    chrome.debugger,
 //  - draws the marks on agents' tabs (the thread's name and a pill).
 
 const HOST = 'dev.browserbear.host';
@@ -401,13 +401,41 @@ const ops = {
     return true;
   },
 
-  // Saves into Chrome's download folder (optionally a subfolder of it) and
-  // waits for the file, so the agent gets a real path back.
-  async download({ url, filename }) {
-    const id = await chrome.downloads.download({ url, filename, conflictAction: 'uniquify' });
-    return waitForDownload(id);
+  // download: fetches the file here, with this profile's cookies and no CORS
+  // in the way (the host permission covers every site), and hands the bytes
+  // to the service in chunks, which writes the file. Not chrome.downloads:
+  // that can only save into ~/Downloads, which macOS keeps agents out of, so
+  // they got a path they couldn't open.
+  async fetchFile({ url }) {
+    const r = await fetch(url, { credentials: 'include' });
+    if (!r.ok) throw new Error(`HTTP ${r.status} ${r.statusText} from ${r.url || url}`);
+    const bytes = new Uint8Array(await r.arrayBuffer());
+    const id = `${Date.now()}-${Math.random().toString(36).slice(2)}`;
+    // Dropped after a while in case the service never comes back for it.
+    fetched.set(id, { bytes, timer: setTimeout(() => fetched.delete(id), FETCHED_MS) });
+    return { id, size: bytes.length, type: r.headers.get('content-type'), disposition: r.headers.get('content-disposition'), url: r.url };
+  },
+
+  async fetchChunk({ id, offset, length }) {
+    const f = fetched.get(id);
+    if (!f) throw new Error('that download is gone from the extension (it was kept for 5 minutes)');
+    const end = Math.min(offset + length, f.bytes.length);
+    if (end >= f.bytes.length) {
+      clearTimeout(f.timer);
+      fetched.delete(id);
+    }
+    return toBase64(f.bytes.subarray(offset, end));
   },
 };
+
+const fetched = new Map(); // fetchFile id -> the bytes the service hasn't taken yet
+const FETCHED_MS = 5 * 60_000;
+
+function toBase64(bytes) {
+  let bin = '';
+  for (let i = 0; i < bytes.length; i += 0x8000) bin += String.fromCharCode.apply(null, bytes.subarray(i, i + 0x8000));
+  return btoa(bin);
+}
 
 // ---- Marks on agents' tabs ----
 // The tab's title becomes "🐻 thread · page title" and its icon gets a dot,
@@ -692,25 +720,6 @@ function waitForLoad(tabId, timeoutMs = 30_000) {
     const timer = setTimeout(done, timeoutMs);
     chrome.tabs.onUpdated.addListener(listener);
     chrome.tabs.get(tabId).then((t) => t.status === 'complete' && done());
-  });
-}
-
-function waitForDownload(id, timeoutMs = 120_000) {
-  return new Promise((resolve, reject) => {
-    const check = async () => {
-      const [item] = await chrome.downloads.search({ id });
-      if (item?.state === 'complete') finish(() => resolve({ path: item.filename, bytes: item.fileSize }));
-      else if (item?.state === 'interrupted') finish(() => reject(new Error(`download interrupted: ${item.error}`)));
-    };
-    const finish = (fn) => {
-      clearTimeout(timer);
-      chrome.downloads.onChanged.removeListener(listener);
-      fn();
-    };
-    const listener = (delta) => delta.id === id && check();
-    const timer = setTimeout(() => finish(() => reject(new Error('download timed out'))), timeoutMs);
-    chrome.downloads.onChanged.addListener(listener);
-    check();
   });
 }
 

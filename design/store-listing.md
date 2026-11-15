@@ -54,7 +54,6 @@ tabs in this Chrome profile, through a local companion app.
 - `tabs`: list open tabs so the user can point an agent at one.
 - `webNavigation`: tell the agent why a page failed to load (a certificate error, a dead
   host), which it can't read from Chrome's own error pages.
-- `downloads`: save a file the agent was asked to fetch, and tell it where it landed.
 - `identity`, `identity.email`: read which Google account this profile is signed into,
   so agents can pick the right profile by account. The email stays on the device.
 - `storage`: remember a random id for this profile, and the agent window's id.

@@ -31,7 +31,12 @@ const USAGE = `browserbear: let agents use your real Chrome profiles
   browserbear upload <tab> <ref|selector> <file...>
                                                 the file input, or the button or label that opens one
                                                 ("Choose files"); snap lists hidden inputs as file-input
-  browserbear download <tab> <url> [filename]
+  browserbear download <tab> <url> [filename] [--to <dir|file>]
+                                                fetches with the tab's sign-in and saves it under BrowserBear's
+                                                folder (~/Library/Application Support/BrowserBear/out/downloads),
+                                                never ~/Downloads, which macOS keeps agents out of. --to moves it
+                                                somewhere of yours. Prints the path, size and type: a sign-in
+                                                page saved as text/html means the link needed more than the cookies
   browserbear dialog <tab> accept|dismiss [text]
   browserbear show <tab>                        bring a tab forward in its window (real clicks need it)
   browserbear handoff <tab|url>                 before asking the user to do something in a tab (sign in,
@@ -77,7 +82,7 @@ function parse(argv) {
       const next = argv[i + 1];
       // --group is gone (Chrome kept every group on the bookmarks bar), but
       // still eats its value so old commands don't read it as a URL.
-      if (next !== undefined && !next.startsWith('--') && ['profile', 'group', 'until-url', 'until-text', 'timeout', 'item'].includes(key)) flags[key] = argv[++i];
+      if (next !== undefined && !next.startsWith('--') && ['profile', 'group', 'until-url', 'until-text', 'timeout', 'item', 'to'].includes(key)) flags[key] = argv[++i];
       else flags[key] = true;
     } else pos.push(a);
   }
@@ -210,6 +215,36 @@ async function handoffAndWait({ tab, untilUrl, untilText, timeoutS }) {
   return 124;
 }
 
+// download --to: done here rather than in the service, as the agent may be
+// able to write where the service (started by Chrome) can't, and vice versa.
+// A folder (one that exists, or ends in /) keeps the file's own name, with
+// " (2)" and so on if that's taken: the name can come from the server, which
+// shouldn't get to replace a file of the agent's (Codex review, 16 Nov). A
+// file path that's already there is an error, never overwritten.
+function moveTo(from, to) {
+  if (to === true) throw new Error('--to needs a folder or file path');
+  let dest = path.resolve(to);
+  const intoDir = to.endsWith('/') || fs.statSync(dest, { throwIfNoEntry: false })?.isDirectory();
+  if (intoDir) fs.mkdirSync(dest, { recursive: true });
+  const { name, ext } = path.parse(path.basename(from));
+  for (let n = 1; ; n++) {
+    const target = intoDir ? path.join(dest, n === 1 ? name + ext : `${name} (${n})${ext}`) : dest;
+    try {
+      fs.copyFileSync(from, target, fs.constants.COPYFILE_EXCL);
+      dest = target;
+      break;
+    } catch (e) {
+      if (e.code !== 'EEXIST') throw e;
+      if (!intoDir) throw new Error(`--to: ${target} is already there; the download is still at ${from}`);
+    }
+  }
+  fs.rmSync(from);
+  // Only the download's own folder in BrowserBear's, never Downloads or anywhere
+  // an older service saved it.
+  if (path.dirname(path.dirname(from)) === path.join(HOME, 'out', 'downloads')) fs.rmdirSync(path.dirname(from));
+  return dest;
+}
+
 // exitCode rather than process.exit(): exiting inside the top-level await
 // makes Node print "Detected unsettled top-level await" under every error.
 const { cmd, pos, flags } = parse(process.argv.slice(2));
@@ -250,6 +285,7 @@ if (cmd === 'agent-only') {
       // Which Threadbear thread is asking, so the tabs it uses carry its name
       // (service/marks.mjs). Unset outside Threadbear: the tab says "agent".
       const result = await request({ id: 1, cmd, args, thread });
+      if (cmd === 'download' && flags.to) result.path = moveTo(result.path, flags.to);
       if (cmd === 'open' && flags.id) console.log(openedId(result));
       else console.log(typeof result === 'string' ? result : JSON.stringify(result, null, 2));
     }

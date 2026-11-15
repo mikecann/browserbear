@@ -544,11 +544,12 @@ const ops = {
     return r?.result?.value ?? { signInForm: null, text: false };
   },
 
-  async cdp({ tabId, method, params, sessionId }) {
+  async cdp({ tabId, method, params, sessionId, timeoutMs }) {
     const tab = tabOf(tabId);
     tab.activeAt = Date.now();
     if (sessionId && frameSessions.get(sessionId)?.tabTarget !== tab.targetId) throw new Error(`No session with given id: ${sessionId}`);
-    return browserCall(method, params || {}, sessionId || (await sessionFor(tab)));
+    // The service can ask to wait longer (download's fetch), never shorter.
+    return browserCall(method, params || {}, sessionId || (await sessionFor(tab)), Math.max(30_000, Number(timeoutMs) || 0));
   },
 
   // The tab's cross-origin iframes, each with the sessionId cdp takes for it.
@@ -578,9 +579,7 @@ const ops = {
     return true;
   },
 
-  async download() {
-    throw new Error(`download isn't in the agents' browser (${BROWSER_NAME}) yet: use a link click, which lands in its Downloads folder`);
-  },
+  // No fetchFile here: the service's download fetches from inside the page.
 };
 
 const BLANK_ANSWERS_MS = 8_000;

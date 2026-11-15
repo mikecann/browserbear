@@ -104,7 +104,7 @@ the installed app as it ships and never bundles or re-signs it. Unlike Google Ch
 it still takes `--load-extension`. It updates itself. 1Password's app doesn't connect to
 it; `browserbear fill` signs in from 1Password without that.
 
-Not yet: `download`, and frames from other origins in `probe`. Any program on this Mac can reach
+Not yet: frames from other origins in `probe`. Any program on this Mac can reach
 the debugging port, as it can reach BrowserBear's socket, so only sign this browser in to
 what you'd let your agents use.
 
@@ -156,6 +156,7 @@ browserbear open https://example.com --profile Work
 browserbear click 1234 e12
 browserbear type 1234 e7 "Hello" --submit
 browserbear upload 1234 e12 ~/talk.mp3         # e12 can be the "Choose files" button
+browserbear download 1234 <url> --to ./files/  # with the tab's sign-in; prints the path
 browserbear read 1234                          # page text; long pages go to a file
 browserbear shot 1234                          # prints the PNG path
 browserbear handoff 1234                       # your turn: the tab comes forward in your Chrome
@@ -212,6 +213,14 @@ real one), the button or label that stands for it, or a CSS selector, and it
 finds the input and sets the files there. A button whose input only appears when
 it's clicked gets clicked, with the picker caught before it opens. Pages that use
 `showOpenFilePicker` instead of an input can't be filled this way.
+
+Downloads never go to `~/Downloads`. macOS keeps agents out of that folder, so a
+file Chrome saved there was a path they couldn't open. `download` has the
+extension fetch the file with the profile's cookies (and no CORS in the way), and
+the service writes it under `~/Library/Application Support/BrowserBear/out/downloads/`.
+`--to` moves it somewhere of the agent's. In the agents' browser, and from an
+extension that hasn't reloaded since, the fetch happens inside the page instead,
+which needs the file to be on the page's own site or to allow it.
 
 When a tab stops answering, BrowserBear works out why instead of timing out
 again and again. If Chrome answers but the page doesn't, the page's own scripts
