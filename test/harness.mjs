@@ -1,6 +1,7 @@
 // Starts the real host (which starts the real service) with the test playing
 // the extension: onOp answers each { id, op, args } the host passes on.
 import fs from 'node:fs';
+import http from 'node:http';
 import path from 'node:path';
 import os from 'node:os';
 import { spawn, execFile } from 'node:child_process';
@@ -103,15 +104,63 @@ export async function headlessChrome(t) {
     });
 }
 
-const CACHE = path.join(os.homedir(), 'Library', 'Caches', 'ms-playwright');
-const build = fs.existsSync(CACHE) && fs.readdirSync(CACHE).filter((d) => /^chromium-\d+$/.test(d)).sort().pop();
-const cft = build && path.join(CACHE, build, 'chrome-mac-arm64', 'Google Chrome for Testing.app', 'Contents', 'MacOS', 'Google Chrome for Testing');
 // Playwright's Chromium, or nothing: branded Chrome won't load unpacked
-// extensions from the command line. BROWSERBEAR_CFT picks another build when
-// the newest is broken: chromium-1255 (Chrome 159) crashed every http page's
-// renderer on the M5 (17 Nov), so each test that loads one failed at its first look.
-const pick = process.env.BROWSERBEAR_CFT || cft;
-export const CFT = pick && fs.existsSync(pick) ? pick : null;
+// extensions from the command line. Not simply the newest build: Playwright's
+// chromium-1255 (Chrome 159) crashed every http page's renderer on the M5
+// (17 Nov), so each test that loads a page failed at its first look while
+// 1248 next to it was fine. So builds are tried newest first on a real page,
+// and the first that loads it is used. BROWSERBEAR_CFT names one outright.
+const CACHE = path.join(os.homedir(), 'Library', 'Caches', 'ms-playwright');
+const binaryIn = (build) => path.join(CACHE, build, 'chrome-mac-arm64', 'Google Chrome for Testing.app', 'Contents', 'MacOS', 'Google Chrome for Testing');
+const builds = () =>
+  (fs.existsSync(CACHE) ? fs.readdirSync(CACHE) : [])
+    .filter((d) => /^chromium-\d+$/.test(d))
+    .sort((a, b) => b.split('-')[1] - a.split('-')[1]) // numerically: 999 is older than 1000
+    .map(binaryIn)
+    .filter((f) => fs.existsSync(f));
+
+// Probing takes a few seconds a build, so each answer is kept, keyed by the
+// binary's path and when it was installed: a reinstall is asked again.
+const PROBED = path.join(os.tmpdir(), 'browserbear-cft-probe.json');
+
+// Whether a build loads a page from a local server headless, as the tests do.
+async function loads(binary) {
+  const server = http.createServer((req, res) => res.end('<p>browserbear-probe-ok</p>'));
+  await new Promise((r) => server.listen(0, '127.0.0.1', r));
+  const profile = fs.mkdtempSync(path.join(os.tmpdir(), 'browserbear-probe-'));
+  try {
+    // --dump-dom prints the page once it's loaded. A broken build prints
+    // nothing and hangs on teardown, hence the timeout.
+    const { stdout } = await run(binary, ['--headless=new', '--no-first-run', `--user-data-dir=${profile}`, '--dump-dom', `http://127.0.0.1:${server.address().port}/`], { timeout: 30_000 }).catch((e) => e);
+    return String(stdout || '').includes('browserbear-probe-ok');
+  } finally {
+    server.close();
+    fs.rmSync(profile, { recursive: true, force: true, maxRetries: 5 });
+  }
+}
+
+async function pickChromium() {
+  if (process.env.BROWSERBEAR_CFT) return fs.existsSync(process.env.BROWSERBEAR_CFT) ? process.env.BROWSERBEAR_CFT : null;
+  let seen = {};
+  try {
+    seen = JSON.parse(fs.readFileSync(PROBED, 'utf8'));
+  } catch {}
+  for (const binary of builds()) {
+    const key = `${binary}@${fs.statSync(binary).mtimeMs}`;
+    if (!(key in seen)) {
+      seen[key] = await loads(binary);
+      // Written whole and renamed, as test files run in parallel processes.
+      const tmp = `${PROBED}.${process.pid}`;
+      fs.writeFileSync(tmp, JSON.stringify(seen));
+      fs.renameSync(tmp, PROBED);
+      if (!seen[key]) console.error(`harness: skipping ${binary}: it can't load a page (see test/harness.mjs)`);
+    }
+    if (seen[key]) return binary;
+  }
+  return null;
+}
+
+export const CFT = await pickChromium();
 const BEAR_ID = 'iljcldkflmlnmfhbllafbbfnchhoccok'; // from the manifest's key
 
 // The real extension in Chrome for Testing, and an inWorker(expression) that
