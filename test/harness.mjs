@@ -107,8 +107,11 @@ const CACHE = path.join(os.homedir(), 'Library', 'Caches', 'ms-playwright');
 const build = fs.existsSync(CACHE) && fs.readdirSync(CACHE).filter((d) => /^chromium-\d+$/.test(d)).sort().pop();
 const cft = build && path.join(CACHE, build, 'chrome-mac-arm64', 'Google Chrome for Testing.app', 'Contents', 'MacOS', 'Google Chrome for Testing');
 // Playwright's Chromium, or nothing: branded Chrome won't load unpacked
-// extensions from the command line.
-export const CFT = cft && fs.existsSync(cft) ? cft : null;
+// extensions from the command line. BROWSERBEAR_CFT picks another build when
+// the newest is broken: chromium-1255 (Chrome 159) crashed every http page's
+// renderer on the M5 (17 Nov), so each test that loads one failed at its first look.
+const pick = process.env.BROWSERBEAR_CFT || cft;
+export const CFT = pick && fs.existsSync(pick) ? pick : null;
 const BEAR_ID = 'iljcldkflmlnmfhbllafbbfnchhoccok'; // from the manifest's key
 
 // The real extension in Chrome for Testing, and an inWorker(expression) that

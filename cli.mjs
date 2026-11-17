@@ -25,7 +25,8 @@ const USAGE = `browserbear: let agents use your real Chrome profiles
                                                 for what snap doesn't list: a real click on the element with that
                                                 text (exactly, else containing it) or matching that selector, after
                                                 hovering it. One hidden until hovered (a card's "Create New") is
-                                                shown by hovering what's around it. Several matches is an error
+                                                shown by hovering what's around it. Looks in iframes too (Google
+                                                Drive's share dialog is one). Several matches is an error
                                                 listing them, unless --nth picks one. Prints the ref it got.
                                                 --reveal <text>: click what has that text first, for options a
                                                 card or menu only shows once it's clicked (skipped if they show)

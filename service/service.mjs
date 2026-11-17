@@ -1231,7 +1231,8 @@ async function hoverNode(tabId, backendNodeId, sending = () => {}) {
 // fell back to eval'd mouse events for divs, a hover-revealed button and
 // <a title=Edit> icons, and some of those clicks silently did nothing.
 // Returns [element, the nearest drawn ancestor of a hidden one, JSON info].
-// Open shadow roots are searched too; cross-origin frames aren't.
+// Open shadow roots are searched too, and iframes by resolveTarget, which
+// runs this in each one.
 const FIND = `function (css, text, nth, peek) {
   const tidy = (s) => String(s ?? '').replace(/\\s+/g, ' ').trim();
   const norm = (s) => tidy(s).toLowerCase();
@@ -1306,8 +1307,9 @@ const FIND = `function (css, text, nth, peek) {
   }
   // For --reveal: whether a drawn match is there already. Errors above (a bad
   // selector) still come back as errors, so nothing gets clicked over them.
-  if (peek) return [null, null, JSON.stringify({ shown: found.els.length > 0 && !found.hidden })];
-  if (!found.els.length) return [null, null, JSON.stringify({ error: 'nothing in the page matches ' + what }) ];
+  if (peek) return [null, null, JSON.stringify({ shown: found.els.length > 0 && !found.hidden, none: !found.els.length })];
+  // none: so resolveTarget knows to look in the page's iframes next.
+  if (!found.els.length) return [null, null, JSON.stringify({ error: 'nothing in the page matches ' + what, none: true })];
   let pool = found.els;
   const hidden = found.hidden;
   if (!hidden) {
@@ -1355,10 +1357,12 @@ const FIND = `function (css, text, nth, peek) {
     const modal = pool.filter((el) => { for (let a = el; a; a = up(a)) if (a.nodeType === 1 && a.matches(':modal, [aria-modal=true]')) return true; return false; });
     if (modal.length && modal.length < pool.length) pool = modal;
   }
-  if (nth > pool.length) return [null, null, JSON.stringify({ error: what + ' matches ' + pool.length + ', so there is no number ' + nth })];
+  // hidden on these too, so resolveTarget can tell several drawn matches (an
+  // answer in itself) from several hidden ones (worth looking in iframes).
+  if (nth > pool.length) return [null, null, JSON.stringify({ error: what + ' matches ' + pool.length + ', so there is no number ' + nth, hidden })];
   if (pool.length > 1 && !nth) {
     const list = pool.slice(0, 8).map((el, i) => '  ' + (i + 1) + '. ' + describe(el)).join('\\n');
-    return [null, null, JSON.stringify({ error: what + ' matches ' + pool.length + (hidden ? ' hidden elements' : '') + '. Say which with --nth <n>, or narrow it:\\n' + list + (pool.length > 8 ? '\\n  ...' : '') })];
+    return [null, null, JSON.stringify({ error: what + ' matches ' + pool.length + (hidden ? ' hidden elements' : '') + '. Say which with --nth <n>, or narrow it:\\n' + list + (pool.length > 8 ? '\\n  ...' : ''), hidden })];
   }
   const el = pool[(nth || 1) - 1];
   let revealer = null;
@@ -1380,22 +1384,46 @@ async function resolveTarget(tabId, { ref, css, text, nth, peek = false }, sendi
   // A selector where the ref goes, as upload takes one.
   if (ref && !css && !text) css = ref;
   if (!css && !text) throw new Error('say what to act on: a ref from browserbear snap (e12), --css <selector> or --text <text>');
-  const group = 'browserbear-find';
+  const expression = `(${FIND})(${JSON.stringify(css || null)}, ${JSON.stringify(text || null)}, ${nth || 0}, ${peek})`;
+  const used = new Set([null]); // the sessions with objects to let go of
   try {
-    const r = await cdp(tabId, 'Runtime.evaluate', { expression: `(${FIND})(${JSON.stringify(css || null)}, ${JSON.stringify(text || null)}, ${nth || 0}, ${peek})`, objectGroup: group });
-    if (r.exceptionDetails) throw new Error(r.exceptionDetails.exception?.description || r.exceptionDetails.text);
-    const { result: props } = await cdp(tabId, 'Runtime.getProperties', { objectId: r.result.objectId, ownProperties: true });
-    const slot = (k) => props.find((p) => p.name === k)?.value;
-    const info = JSON.parse(slot('2').value);
-    if (info.error) throw new Error(`in tab ${tabId}, ${info.error}`);
-    if (peek) return { shown: info.shown };
-    if (info.error) throw new Error(`in tab ${tabId}, ${info.error}`);
-    const backendOf = async (o) => (o?.objectId ? (await cdp(tabId, 'DOM.describeNode', { objectId: o.objectId })).node.backendNodeId : null);
+    let hit = await findIn(tabId, expression, null);
+    // Not drawn in the page itself: then in its iframes. Google Drive's share
+    // dialog is one (17 Nov), and --text "Restricted" said nothing matched.
+    // Several matches in the page is its error, as is a bad selector: those
+    // stand, rather than a lone match in some frame being taken instead.
+    const lookFurther = hit.info.none || (peek ? !hit.info.shown : hit.info.hidden === true);
+    let frames = [];
+    if (lookFurther) {
+      const inFrames = await findInFrames(tabId, expression, used);
+      frames = inFrames.frames;
+      // Only a drawn match beats one hidden in the page; a hidden one in a
+      // frame is a last resort, after anything in the page itself.
+      // A frame with several drawn matches counts, as its own error: left out,
+      // a lone match in another frame would be clicked instead (Codex's review).
+      const drawnIn = inFrames.hits.filter((h) => (peek ? h.info.shown : h.info.hidden === false));
+      // A peek only asks whether one is showing: hidden ones in several frames
+      // are what --reveal is for, not an error before it opens anything.
+      const pool = drawnIn.length ? drawnIn : hit.info.none && !peek ? inFrames.hits : [];
+      if (pool.length > 1) {
+        throw new Error(`in tab ${tabId}, ${what(css, text)} is in ${pool.length} of the page's iframes (${pool.map((h) => `[frame ${h.host}]`).join(', ')}). Snap it and click by ref instead`);
+      }
+      if (pool.length) hit = pool[0];
+    }
+    const { info, slot, session, host } = hit;
+    if (info.error && !info.none) throw new Error(`in tab ${tabId}, ${host ? `in [frame ${host}], ` : ''}${info.error}`);
+    if (peek) return { shown: !!info.shown };
+    if (info.none) {
+      const also = frames.length ? `, or in any of its ${frames.length} iframe${frames.length > 1 ? 's' : ''} (${frames.slice(0, 6).join(', ')}${frames.length > 6 ? ', …' : ''})` : '';
+      throw new Error(`in tab ${tabId}, ${info.error}${also}`);
+    }
+    const where = host ? ` in [frame ${host}]` : '';
+    const backendOf = async (o) => (o?.objectId ? frameNode(session, (await cdp(tabId, 'DOM.describeNode', { objectId: o.objectId }, undefined, session)).node.backendNodeId) : null);
     const node = await backendOf(slot('0'));
     const named = state(tabId).refs.ref(node);
-    if (!info.hidden) return { node, ref: named, note: `(${named} is ${info.desc})` };
+    if (!info.hidden) return { node, ref: named, note: `(${named} is ${info.desc}${where})` };
     const revealer = await backendOf(slot('1'));
-    if (!revealer) throw new Error(`in tab ${tabId}, ${info.desc} is hidden, and nothing around it is drawn to hover over`);
+    if (!revealer) throw new Error(`in tab ${tabId}, ${info.desc}${where} is hidden, and nothing around it is drawn to hover over`);
     const how = await hoverNode(tabId, revealer, sending);
     await sleep(HOVER_MS);
     const { object } = await cdp(tabId, 'DOM.resolveNode', { backendNodeId: node });
@@ -1404,11 +1432,51 @@ async function resolveTarget(tabId, { ref, css, text, nth, peek = false }, sendi
       functionDeclaration: `function () { const r = this.getBoundingClientRect(); return r.width > 0 && r.height > 0 && this.checkVisibility({ opacityProperty: true, visibilityProperty: true }); }`,
       returnByValue: true,
     });
-    if (!result.value) throw new Error(`in tab ${tabId}, ${info.desc} is hidden, and hovering over ${info.revealer} didn't show it${how ? ` ${how}` : ''}. If it opens on a click (a card or menu that shows its options when clicked), add --reveal "<the text of what opens it>" to click that first, or click it yourself and then this again`);
-    return { node, ref: named, note: `(${named} is ${info.desc}; it showed once the pointer was over ${info.revealer})` };
+    if (!result.value) throw new Error(`in tab ${tabId}, ${info.desc}${where} is hidden, and hovering over ${info.revealer} didn't show it${how ? ` ${how}` : ''}. If it opens on a click (a card or menu that shows its options when clicked), add --reveal "<the text of what opens it>" to click that first, or click it yourself and then this again`);
+    return { node, ref: named, note: `(${named} is ${info.desc}${where}; it showed once the pointer was over ${info.revealer})` };
   } finally {
-    cdp(tabId, 'Runtime.releaseObjectGroup', { objectGroup: group }).catch(() => {});
+    for (const session of used) cdp(tabId, 'Runtime.releaseObjectGroup', { objectGroup: FIND_GROUP }, undefined, session).catch(() => {});
   }
+}
+
+const FIND_GROUP = 'browserbear-find';
+const what = (css, text) => (css ? `the selector "${css}"` : `the text "${text}"`);
+
+// Runs FIND in the page (doc null) or one of documents()'s frames, keeping
+// the elements it found as objects. session is what cdp() is to send their
+// commands to: null for the tab's own process, else the cross-origin frame
+// whose process the document is in.
+async function findIn(tabId, expression, doc, id = null, timeoutMs = CDP_WAIT_MS) {
+  const session = doc ? doc.session : null;
+  let contextId;
+  // One sharing a process with its parent is reached through an isolated
+  // world made in it, as evalIn does; a cross-origin one's own main world is
+  // its session's default.
+  if (doc?.inProcess) contextId = (await cdp(tabId, 'Page.createIsolatedWorld', { frameId: id, worldName: 'browserbear' }, timeoutMs, session)).executionContextId;
+  const r = await cdp(tabId, 'Runtime.evaluate', { expression, objectGroup: FIND_GROUP, ...(contextId ? { contextId } : {}) }, timeoutMs, session);
+  if (r.exceptionDetails) throw new Error(r.exceptionDetails.exception?.description || r.exceptionDetails.text);
+  const { result: props } = await cdp(tabId, 'Runtime.getProperties', { objectId: r.result.objectId, ownProperties: true }, timeoutMs, session);
+  const slot = (k) => props.find((p) => p.name === k)?.value;
+  return { info: JSON.parse(slot('2').value), slot, session, host: doc ? hostOf(doc.url) || doc.url : null };
+}
+
+// FIND in every drawn iframe of the tab. hits: the frames with a match (or
+// an error, such as several matches); frames: the hosts of all it looked in,
+// for saying where it looked when nothing matched anywhere. A frame that
+// doesn't answer in time is left out, as snap leaves it out.
+async function findInFrames(tabId, expression, used) {
+  const docs = await documents(tabId);
+  if (!docs.size) return { hits: [], frames: [] };
+  const own = new Map(await Promise.all([...docs].map(async ([id, d]) => [id, await frameShown(tabId, id, d, docs)])));
+  // A frame inside a hidden one is hidden too (as read has it).
+  const shown = (id) => id === null || !docs.has(id) || (own.get(id) && shown(docs.get(id).parent));
+  const looked = [...docs].filter(([id]) => shown(id));
+  for (const [, d] of looked) used.add(d.session);
+  const results = await Promise.all(looked.map(([id, d]) => findIn(tabId, expression, d, id, PROBE_MS).catch(unlessCutOff)));
+  return {
+    hits: results.filter((r) => r && !r.info.none),
+    frames: [...new Set(looked.map(([, d]) => hostOf(d.url) || d.url))],
+  };
 }
 
 // Whether a ref's line in the last snapshot was a plain clickable element,

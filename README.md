@@ -84,7 +84,10 @@ browserbear CLI (or Threadbear)
   out of reach of the tab's debugger session. The extension and the agents' browser
   attach to each one as a child session (`Target.setAutoAttach`), and the service
   numbers its controls with the page's, under a `[frame <host>]` line where the iframe
-  is. `read` adds each frame's text, and `type -` follows focus into one. Clicks go to
+  is. `read` adds each frame's text, and `type -` follows focus into one. `--text` and
+  `--css` look in the page first, then in its drawn iframes when the page has nothing
+  drawn that matches (Google Drive's share dialog is a frame), and say which frame they
+  found it in, or which frames they looked in when nothing matched. Clicks go to
   the frame's own session at its own coordinates: sent to the tab, Chrome sometimes
   still had the frame where it was before a scroll and gave the click to the page.
 - `key Shift+Enter` adds a line break in rich editors, and `type` keeps the newlines in

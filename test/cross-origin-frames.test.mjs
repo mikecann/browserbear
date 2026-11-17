@@ -16,6 +16,8 @@ import { CFT, extensionInChrome, startBear } from './harness.mjs';
 const TOP = (framePort, samePort) => `<!doctype html><title>Signup</title>
 <h1>Create a developer account</h1>
 <button id="outside">Outside</button>
+<!-- Hidden in the page twice: the drawn one in the frame still wins (Codex's review). -->
+<div hidden><button>Verify</button><button>Verify</button></div>
 <iframe src="http://127.0.0.1:${samePort}/" style="height: 60px"></iframe>
 <iframe src="/same" style="height: 60px"></iframe>
 <div style="margin: 300px 0 0 120px" role="dialog" aria-label="Create a payments profile">
@@ -56,7 +58,7 @@ const SAME_SITE = `<p>Same site</p><button onclick="this.textContent = 'Pressed'
 test('snap, read, click and type reach into a cross-origin iframe', { skip: !CFT && 'no Chrome for Testing' }, async (t) => {
   const server = http.createServer((req, res) => {
     res.setHeader('content-type', 'text/html');
-    res.end(req.url === '/helper' ? HELPER : req.url === '/nest' ? NEST(sameSite.address().port) : req.url === '/contents' ? CONTENTS : req.url === '/frame' ? FRAME : req.url === '/same' ? '<button>Same origin</button>' : TOP(server.address().port, sameSite.address().port));
+    res.end(req.url === '/helper' ? HELPER : req.url === '/nest' ? NEST(sameSite.address().port) : req.url === '/contents' ? CONTENTS : req.url === '/frame' ? FRAME : req.url === '/same' ? '<button onclick="this.textContent = \'Same origin pressed\'">Same origin</button>' : TOP(server.address().port, sameSite.address().port));
   });
   const sameSite = http.createServer((req, res) => {
     res.setHeader('content-type', 'text/html');
@@ -124,4 +126,13 @@ test('snap, read, click and type reach into a cross-origin iframe', { skip: !CFT
   // With no ref, type goes wherever focus is, which is in the frame now.
   await browserbear('type', String(tabId), '-', '2');
   assert.equal(await frameText('duns.value'), '12');
+
+  // --text finds what's only in a frame, as Google Drive's share dialog has
+  // its "Restricted" (17 Nov): a cross-origin one, in its own process...
+  assert.match(await browserbear('click', String(tabId), '--text', 'Verify'), /\(e\d+ is button "Verify"[^)]* in \[frame localhost:\d+\]\)/);
+  assert.equal(await frameText('said.textContent'), 'clicked with 12');
+  // ...and a same-origin one, which shares the page's.
+  assert.match(await browserbear('click', String(tabId), '--text', 'Same origin'), /button "Same origin pressed"/);
+  // Nothing anywhere says where it looked.
+  await assert.rejects(browserbear('click', String(tabId), '--text', 'Nowhere at all'), /nothing in the page matches the text "Nowhere at all", or in any of its \d+ iframes \([^)]*localhost[^)]*\)/);
 });
