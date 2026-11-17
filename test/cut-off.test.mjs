@@ -55,7 +55,7 @@ test("snap doesn't take a cut-off as a page with no frames", async (t) => {
 
 test('a cut-off that lasts is named, and open --id still prints only the id', async (t) => {
   const page = fakePage(60_000);
-  const bear = await startBear(t, page.onOp, { BROWSERBEAR_CUT_OFF_WAIT_MS: '1500' });
+  const bear = await startBear(t, page.onOp, { BROWSERBEAR_CUT_OFF_WAIT_MS: '3000' });
   page.set(bear);
   const started = Date.now();
   const e = await bear.browserbear('open', 'https://campaigns.example/', '--profile', 'Work', '--id').then(() => null, (err) => err);
@@ -63,6 +63,9 @@ test('a cut-off that lasts is named, and open --id still prints only the id', as
   assert.equal(e.stdout, '9\n');
   assert.match(e.stderr, /opened tab 9 in Work.*couldn't look at it yet: Chrome kept cutting BrowserBear's debugger off from tab 9.*canceled_by_user/);
   // One wait, not one for each look open makes.
-  assert.ok(Date.now() - started < 6_000, `took ${Date.now() - started} ms`);
+  assert.ok(Date.now() - started < 8_000, `took ${Date.now() - started} ms`);
+  // Straight after giving up, the next command doesn't wait it all out again.
+  const again = Date.now();
   await assert.rejects(bear.browserbear('read', '9'), /kept cutting BrowserBear's debugger off from tab 9/);
+  assert.ok(Date.now() - again < 1_400, `read took ${Date.now() - again} ms`);
 });

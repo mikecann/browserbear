@@ -376,10 +376,15 @@ const ops = {
         await chrome.debugger.sendCommand({ tabId }, 'Target.setAutoAttach', AUTO_ATTACH);
       } catch (e) {
         autoAttached.delete(tabId);
+        // Cut off (see attach()): only a look, so it's safe to try again.
+        if (/Detached while handling|not attached/.test(String(e?.message))) throw new Error(`Debugger is not attached to the tab with id: ${tabId}. (Chrome cut it off)`);
         throw e;
       }
       // The frames already there arrive as events just after.
       await new Promise((r) => setTimeout(r, 150));
+      // Cut off while waiting: the list is empty because the session ended,
+      // not because the page has no frames.
+      if (!attached.has(tabId)) throw new Error(`Debugger is not attached to the tab with id: ${tabId}. (Chrome cut it off)`);
     }
     return [...(frameSessions.get(tabId) || [])].map(([sessionId, f]) => ({ sessionId, ...f }));
   },

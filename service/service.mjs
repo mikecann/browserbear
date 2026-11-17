@@ -560,13 +560,23 @@ const CUT_OFF_WAIT_MS = Number(process.env.BROWSERBEAR_CUT_OFF_WAIT_MS) || 20_00
 
 // The budget is for being cut off, not for the command: one that gets in on
 // the last try still has its own timeout.
+// Once a command has waited the whole budget, the ones after it (and the
+// looks that shrug off errors) fail at once until one gets in: a type, with
+// its several looks before it types, added up to 80 s of waits (Codex's review).
 async function whileCutOff(tabId, attempt) {
-  for (const until = Date.now() + CUT_OFF_WAIT_MS; ; ) {
+  const s = state(tabId);
+  const wait = s.gaveUpAt && Date.now() - s.gaveUpAt < CUT_OFF_WAIT_MS ? 0 : CUT_OFF_WAIT_MS;
+  for (const until = Date.now() + wait; ; ) {
     try {
-      return await attempt();
+      const result = await attempt();
+      s.gaveUpAt = null;
+      return result;
     } catch (e) {
       if (!CUT_OFF.test(e.message)) throw e;
-      if (Date.now() >= until) throw cutOffError(tabId, e);
+      if (Date.now() >= until) {
+        if (wait) s.gaveUpAt = Date.now();
+        throw cutOffError(tabId, e);
+      }
       await sleep(500);
     }
   }
@@ -885,7 +895,9 @@ async function frameShown(tabId, id, d, docs) {
       parent,
     );
     return result?.value !== false;
-  } catch {
+  } catch (e) {
+    // Cut off isn't a slow parent: read would leave the frame's text out.
+    if (e.cutOff) throw e;
     return true;
   }
 }
@@ -900,8 +912,8 @@ async function frameTrees(tabId) {
     [...docs].map(async ([id, d]) => {
       // A short wait: one stuck ad frame mustn't hold up a look at the page.
       [d.nodes, d.owner, d.files] = await Promise.all([
-        cdp(tabId, 'Accessibility.getFullAXTree', d.inProcess ? { frameId: id } : {}, PROBE_MS, d.session).then((r) => r.nodes, () => null),
-        cdp(tabId, 'DOM.getFrameOwner', { frameId: id }, PROBE_MS, sessionOf(d.parent)).then((r) => r.backendNodeId, () => null),
+        cdp(tabId, 'Accessibility.getFullAXTree', d.inProcess ? { frameId: id } : {}, PROBE_MS, d.session).then((r) => r.nodes, unlessCutOff),
+        cdp(tabId, 'DOM.getFrameOwner', { frameId: id }, PROBE_MS, sessionOf(d.parent)).then((r) => r.backendNodeId, unlessCutOff),
         d.inProcess ? inProcessFileInputs(tabId, id, d) : fileInputs(tabId, id, PROBE_MS),
       ]);
     }),
@@ -1767,6 +1779,12 @@ const unlessRefused = (e) => {
   if (e.refused || e.closed || e.stuck || e.cutOff) throw e;
   return null;
 };
+// A frame that can't be looked at is left out, but not one BrowserBear was
+// cut off from: snap and read would quietly come back without it.
+const unlessCutOff = (e) => {
+  if (e.cutOff) throw e;
+  return null;
+};
 // For the looks that are only nice to have (is it drawn yet?): anything but a
 // stuck page is shrugged off.
 const unlessStuck = (e) => {
@@ -2117,7 +2135,7 @@ const commands = {
     // fine from inside the hidden document (Codex's review, 11 Nov).
     const own = new Map(await Promise.all(frames.map(async ([id, d]) => [id, await frameShown(tab, id, d, docs)])));
     const shown = (id) => id === null || !docs.has(id) || (own.get(id) && shown(docs.get(id).parent));
-    const inner = await Promise.all(frames.map(([id, d]) => (shown(id) ? evalIn(tab, id, d, FRAME_TEXT).then((r) => r.result?.value, () => '') : '')));
+    const inner = await Promise.all(frames.map(([id, d]) => (shown(id) ? evalIn(tab, id, d, FRAME_TEXT).then((r) => r.result?.value, (e) => (unlessCutOff(e), '')) : '')));
     frames.forEach(([, f], i) => {
       if (typeof inner[i] === 'string' && inner[i].trim()) text += `\n\n[frame ${hostOf(f.url) || f.url}]\n${inner[i]}`;
     });
