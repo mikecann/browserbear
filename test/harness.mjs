@@ -65,10 +65,17 @@ export async function startBear(t, onOp, extraEnv = {}, { instance = 'inst-1' } 
 
 export const CHROME = process.env.CHROME_PATH || '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome';
 
+// Every Chrome the tests start gets this. Without it Chrome reads its cookie key
+// from the login keychain, and on a build macOS hasn't seen before (each new
+// Playwright Chromium) that pops a "wants to use Chromium Safe Storage" password
+// prompt on Mike's screen for every launch, while the launch sits waiting on it.
+// Playwright passes it too; the tests launch Chrome themselves, so they must.
+const NO_KEYCHAIN = '--use-mock-keychain';
+
 // A real headless Chrome, and a send(method, params, sessionId) for its CDP.
 export async function headlessChrome(t) {
   const profile = fs.mkdtempSync(path.join(os.tmpdir(), 'browserbear-chrome-'));
-  const chrome = spawn(CHROME, ['--headless', '--remote-debugging-port=0', `--user-data-dir=${profile}`, '--no-first-run', 'about:blank'], { stdio: 'ignore' });
+  const chrome = spawn(CHROME, ['--headless', NO_KEYCHAIN, '--remote-debugging-port=0', `--user-data-dir=${profile}`, '--no-first-run', 'about:blank'], { stdio: 'ignore' });
   t.after(async () => {
     // Chrome keeps writing to its profile until it has really gone.
     const gone = new Promise((r) => chrome.once('exit', r));
@@ -105,11 +112,11 @@ export async function headlessChrome(t) {
 }
 
 // Playwright's Chromium, or nothing: branded Chrome won't load unpacked
-// extensions from the command line. Not simply the newest build: Playwright's
-// chromium-1255 (Chrome 159) crashed every http page's renderer on the M5
-// (17 Nov), so each test that loads a page failed at its first look while
-// 1248 next to it was fine. So builds are tried newest first on a real page,
-// and the first that loads it is used. BROWSERBEAR_CFT names one outright.
+// extensions from the command line. Builds are tried newest first on a real
+// page and the first that loads it is used, so a broken install is skipped
+// rather than failing every test. (On 17 Nov chromium-1255 looked broken, but it
+// was only stuck on the keychain prompt NO_KEYCHAIN now avoids.)
+// BROWSERBEAR_CFT names one outright.
 const CACHE = path.join(os.homedir(), 'Library', 'Caches', 'ms-playwright');
 const binaryIn = (build) => path.join(CACHE, build, 'chrome-mac-arm64', 'Google Chrome for Testing.app', 'Contents', 'MacOS', 'Google Chrome for Testing');
 const builds = () =>
@@ -121,7 +128,8 @@ const builds = () =>
 
 // Probing takes a few seconds a build, so each answer is kept, keyed by the
 // binary's path and when it was installed: a reinstall is asked again.
-const PROBED = path.join(os.tmpdir(), 'browserbear-cft-probe.json');
+// v2: answers from before NO_KEYCHAIN were keychain hangs, not broken builds.
+const PROBED = path.join(os.tmpdir(), 'browserbear-cft-probe-v2.json');
 
 // Whether a build loads a page from a local server headless, as the tests do.
 async function loads(binary) {
@@ -131,7 +139,7 @@ async function loads(binary) {
   try {
     // --dump-dom prints the page once it's loaded. A broken build prints
     // nothing and hangs on teardown, hence the timeout.
-    const { stdout } = await run(binary, ['--headless=new', '--no-first-run', `--user-data-dir=${profile}`, '--dump-dom', `http://127.0.0.1:${server.address().port}/`], { timeout: 30_000 }).catch((e) => e);
+    const { stdout } = await run(binary, ['--headless=new', NO_KEYCHAIN, '--no-first-run', `--user-data-dir=${profile}`, '--dump-dom', `http://127.0.0.1:${server.address().port}/`], { timeout: 30_000 }).catch((e) => e);
     return String(stdout || '').includes('browserbear-probe-ok');
   } finally {
     server.close();
@@ -168,7 +176,7 @@ const BEAR_ID = 'iljcldkflmlnmfhbllafbbfnchhoccok'; // from the manifest's key
 export async function extensionInChrome(t, otherExtensions = []) {
   const profile = fs.mkdtempSync(path.join(os.tmpdir(), 'browserbear-cft-'));
   const exts = [path.join(root, 'extension'), ...otherExtensions].join(',');
-  const chrome = spawn(CFT, ['--headless=new', '--remote-debugging-port=0', `--user-data-dir=${profile}`, '--no-first-run', `--disable-extensions-except=${exts}`, `--load-extension=${exts}`, 'about:blank'], { stdio: 'ignore' });
+  const chrome = spawn(CFT, ['--headless=new', NO_KEYCHAIN, '--remote-debugging-port=0', `--user-data-dir=${profile}`, '--no-first-run', `--disable-extensions-except=${exts}`, `--load-extension=${exts}`, 'about:blank'], { stdio: 'ignore' });
   t.after(async () => {
     const gone = new Promise((r) => chrome.once('exit', r));
     chrome.kill();
