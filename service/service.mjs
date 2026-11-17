@@ -462,7 +462,13 @@ async function cdp(tabId, method, params, timeoutMs = CDP_WAIT_MS, frame = null)
 // browser), as targetId -> { sessionId, url, parent targetId or null }. An
 // extension from before frames gives none, which is how pages looked before.
 async function loadFrames(tabId) {
-  const got = await call(await ownerOf(tabId), 'frames', { tabId }).catch(() => []);
+  // A cut-off that lasts is an error, not a page with no frames: snap would
+  // quietly leave out a payments form.
+  const p = await ownerOf(tabId);
+  const got = await whileCutOff(tabId, () => call(p, 'frames', { tabId })).catch((e) => {
+    if (e.cutOff) throw e;
+    return [];
+  });
   const list = Array.isArray(got) ? got : [];
   const bySession = new Map(list.map((f) => [f.sessionId, f.targetId]));
   const frames = new Map(list.map((f) => [f.targetId, { sessionId: f.sessionId, url: f.url, parent: (f.parent && bySession.get(f.parent)) || null }]));
@@ -472,18 +478,24 @@ async function loadFrames(tabId) {
 
 async function sendToFrame(p, tabId, frame, method, params, timeoutMs) {
   let f = state(tabId).frames.get(frame);
-  for (let tries = 0; ; tries++) {
-    if (!f) f = (await loadFrames(tabId)).get(frame);
-    if (!f) throw new Error(`that ref is in a frame tab ${tabId} no longer has; snap ${tabId} for fresh refs`);
-    try {
-      return await call(p, 'cdp', { tabId, method, params, sessionId: f.sessionId }, timeoutMs);
-    } catch (e) {
-      // The extension detaches after 30 s idle, which ends the frame's session
-      // too; asking for frames again gives the same frame a new one.
-      if (tries || !/session/i.test(e.message)) throw e;
-      f = null;
+  let renewed = false;
+  // Cut off (see send()): attaching again gives every frame a new session, so
+  // each try asks for the frames afresh.
+  return whileCutOff(tabId, async () => {
+    for (;;) {
+      if (!f) f = (await loadFrames(tabId)).get(frame);
+      if (!f) throw new Error(`that ref is in a frame tab ${tabId} no longer has; snap ${tabId} for fresh refs`);
+      try {
+        return await call(p, 'cdp', { tabId, method, params, sessionId: f.sessionId }, timeoutMs);
+      } catch (e) {
+        // The extension detaches after 30 s idle, which ends the frame's session
+        // too; asking for frames again gives the same frame a new one.
+        f = null;
+        if (renewed || CUT_OFF.test(e.message) || !/session/i.test(e.message)) throw e;
+        renewed = true;
+      }
     }
-  }
+  });
 }
 
 // Remote objects made in a frame live there, so later commands on them
@@ -546,10 +558,12 @@ async function refusal(p, tabId) {
 const CUT_OFF = /Debugger is not attached/;
 const CUT_OFF_WAIT_MS = Number(process.env.BROWSERBEAR_CUT_OFF_WAIT_MS) || 20_000;
 
-async function send(p, tabId, method, params, timeoutMs) {
+// The budget is for being cut off, not for the command: one that gets in on
+// the last try still has its own timeout.
+async function whileCutOff(tabId, attempt) {
   for (const until = Date.now() + CUT_OFF_WAIT_MS; ; ) {
     try {
-      return await sendOnce(p, tabId, method, params, timeoutMs);
+      return await attempt();
     } catch (e) {
       if (!CUT_OFF.test(e.message)) throw e;
       if (Date.now() >= until) throw cutOffError(tabId, e);
@@ -557,6 +571,8 @@ async function send(p, tabId, method, params, timeoutMs) {
     }
   }
 }
+
+const send = (p, tabId, method, params, timeoutMs) => whileCutOff(tabId, () => sendOnce(p, tabId, method, params, timeoutMs));
 
 // cutOff: the waits for a page to load or draw stop at this rather than wait
 // out the same 20 s again.
@@ -936,7 +952,10 @@ const settle = () => sleep(SETTLE_MS);
 const MARK = `window.__browserbear = 'here'; addEventListener('beforeunload', () => { window.__browserbear = 'leaving'; }); true`;
 
 async function markPage(tabId) {
-  await evaluate(tabId, MARK).catch(() => {});
+  await evaluate(tabId, MARK).catch((e) => {
+    // Cut off already took its 20 s; the command after this would take another.
+    if (e.cutOff) throw e;
+  });
 }
 
 async function settleAfterAction(tabId, timeoutMs = 20_000) {
@@ -950,7 +969,10 @@ async function settleAfterAction(tabId, timeoutMs = 20_000) {
     // Mid-navigation there may be no context to evaluate in yet.
     // Refused: it went to a warning page, which won't change by waiting, and
     // the snapshot after this says so.
-    const look = await evaluate(tabId, `[window.__browserbear ?? null, document.readyState]`).catch((e) => (e.refused ? ['here'] : null));
+    const look = await evaluate(tabId, `[window.__browserbear ?? null, document.readyState]`).catch((e) => {
+      if (e.cutOff) throw e;
+      return e.refused ? ['here'] : null;
+    });
     if (!look && (await tabNow(tabId)) === null) return; // it closed, which isn't going to load
     const [mark, ready] = look || ['leaving'];
     if (mark === 'here') break;

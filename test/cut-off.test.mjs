@@ -18,12 +18,13 @@ function fakePage(cutOffFor) {
       until = Date.now() + cutOffFor;
       return tab;
     }
-    if (op === 'cdp') {
+    if (op === 'cdp' || op === 'frames') {
       if (until === null) until = Date.now() + cutOffFor;
       if (Date.now() < until) {
         bear.fromExtension({ type: 'event', event: 'detached', tabId: 9, reason: 'canceled_by_user' });
         throw new Error('Debugger is not attached to the tab with id: 9.');
       }
+      if (op === 'frames') return [];
       if (args.method === 'Runtime.evaluate') {
         const x = args.params.expression;
         return { result: { value: x.includes('readyState') ? 'complete' : x.includes('visibilityState') ? 'visible' : x.includes('innerText') ? 'Campaign text' : true } };
@@ -43,6 +44,13 @@ test('open and read wait out a short cut-off instead of failing', async (t) => {
   const bear = await startBear(t, page.onOp);
   page.set(bear);
   assert.equal(await bear.browserbear('open', 'https://campaigns.example/', '--profile', 'Work', '--id'), '9');
+});
+
+test("snap doesn't take a cut-off as a page with no frames", async (t) => {
+  const page = fakePage(60_000);
+  const bear = await startBear(t, page.onOp, { BROWSERBEAR_CUT_OFF_WAIT_MS: '1000' });
+  page.set(bear);
+  await assert.rejects(bear.browserbear('snap', '9'), /kept cutting BrowserBear's debugger off from tab 9/);
 });
 
 test('a cut-off that lasts is named, and open --id still prints only the id', async (t) => {

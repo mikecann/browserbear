@@ -729,7 +729,15 @@ async function attach(tabId) {
     try {
       await chrome.debugger.attach({ tabId }, '1.3');
       // So dialogs (like "Leave site?") are reported from the first command.
-      await chrome.debugger.sendCommand({ tabId }, 'Page.enable');
+      await chrome.debugger.sendCommand({ tabId }, 'Page.enable').catch((e) => {
+        // Chrome cut us off as we attached (canceled_by_user, when one of its
+        // windows can't show the "debugging this browser" bar). Said the way
+        // Chrome says it before a command is sent, so the service knows the
+        // command never ran and tries again: "Detached while handling command"
+        // would read as one that may have (Zoho, 17 Nov 2026).
+        if (/Detached while handling|not attached/.test(String(e?.message))) throw new Error(`Debugger is not attached to the tab with id: ${tabId}. (Chrome cut it off as it attached)`);
+        throw e;
+      });
     } catch (e) {
       // Already attached by us from before a worker restart is fine.
       if (!String(e?.message).includes('Another debugger is already attached')) throw e;
