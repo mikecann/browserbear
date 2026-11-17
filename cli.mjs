@@ -17,9 +17,18 @@ const USAGE = `browserbear: let agents use your real Chrome profiles
   browserbear open <url> --profile p [--id]     --id: print only the new tab's id. Use that id from then on,
                                                 never a grep of tabs: the user may have the same page open
   browserbear claim <text|tab> [--profile p]    find one of the user's open tabs by URL, title or id, to work in
-  browserbear snap <tab> [--full]               what's on the page (a diff after the first look)
+  browserbear snap <tab> [--full]               what's on the page (a diff after the first look). Plain elements
+                                                the page takes clicks on (a <div> with a handler) are "clickable"
   browserbear click <tab> <ref> [--script]       --script: a script click, for pages that ignore real ones
                                                 (a link that ignores a real click gets one by itself)
+  browserbear click <tab> --text <text> | --css <selector> [--nth n]
+                                                for what snap doesn't list: a real click on the element with that
+                                                text (exactly, else containing it) or matching that selector, after
+                                                hovering it. One hidden until hovered (a card's "Create New") is
+                                                shown by hovering what's around it. Several matches is an error
+                                                listing them, unless --nth picks one. Prints the ref it got
+  browserbear hover <tab> <ref> | --text <text> | --css <selector> [--nth n]
+                                                put the pointer over it, for menus and buttons that show on hover
   browserbear type <tab> <ref|-> <text> [--submit] [--replace]
                                                 fails if the text does not end up in the field
   browserbear key <tab> <key>                   Enter, Escape, Tab, Home, End, F1-F12, Meta+a, Shift+Enter (a line
@@ -56,7 +65,7 @@ const USAGE = `browserbear: let agents use your real Chrome profiles
   browserbear release <tab>                     take BrowserBear's marks off a tab and let go of it
 
 The user's own tabs (not opened by an agent, or handed to them) can be looked at with snap, read, shot
-and eval. click, type, key, goto, upload and dialog need claim first, or --user-tab, and only when the
+and eval. click, hover, type, key, goto, upload and dialog need claim first, or --user-tab, and only when the
 user asked for work in that tab. close refuses them unless --user-tab, so only when they asked for it.
   browserbear reload [--profile p]              reload the extension after changing it (all profiles by default)
   browserbear status
@@ -82,7 +91,7 @@ function parse(argv) {
       const next = argv[i + 1];
       // --group is gone (Chrome kept every group on the bookmarks bar), but
       // still eats its value so old commands don't read it as a URL.
-      if (next !== undefined && !next.startsWith('--') && ['profile', 'group', 'until-url', 'until-text', 'timeout', 'item', 'to'].includes(key)) flags[key] = argv[++i];
+      if (next !== undefined && !next.startsWith('--') && ['profile', 'group', 'until-url', 'until-text', 'timeout', 'item', 'to', 'css', 'text', 'nth'].includes(key)) flags[key] = argv[++i];
       else flags[key] = true;
     } else pos.push(a);
   }
@@ -106,7 +115,8 @@ function argsFor(cmd, pos, flags) {
     case 'snap':
       return { tab: a, full: !!flags.full };
     case 'click':
-      return { tab: a, ref: b, script: !!flags.script };
+    case 'hover':
+      return { tab: a, ref: b, css: flags.css, text: flags.text, nth: flags.nth === undefined ? undefined : flags.nth === true ? NaN : Number(flags.nth), script: cmd === 'click' && !!flags.script };
     case 'type':
       return { tab: a, ref: b === '-' ? undefined : b, text: rest.join(' '), submit: !!flags.submit, replace: !!flags.replace };
     case 'key':

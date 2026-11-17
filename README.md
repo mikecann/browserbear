@@ -37,6 +37,18 @@ browserbear CLI (or Threadbear)
 - Snapshots list headings and things you can click or type in, with refs (`e12`) that
   stay on the same element. After the first look you get only what changed, so most
   steps cost a few hundred tokens rather than 15k.
+- Some apps build their controls from plain `<div>`, `<p>` and `<a>` with no href and
+  a script listening for clicks (Zoho Campaigns' campaign cards, sender menus and icon
+  links). Snapshots list those as `clickable`, named by their text or title: the
+  innermost one, and never one that holds a real control, so a React root listening
+  for every click doesn't swallow the page. Chrome's DOM snapshot says which elements
+  have a click listener, and `cursor: pointer` catches the ones a page handles from the
+  document. `click` and `hover` also take `--text` or `--css` (with `--nth` when several
+  match, which is otherwise an error listing them) for anything a snapshot can't name.
+  That's a real click at the element's centre after moving the pointer onto it, and
+  only something on top can be picked, so a dialog's "Delete" wins over the row's behind
+  it. A match that's hidden until hovered (a card's "Create New") is shown by hovering
+  the nearest thing around it that's drawn.
 - Everything that changes a page answers with that diff, so there's no separate look.
 - The extension detaches from a tab 30 s after its last command, so Chrome's "started
   debugging this browser" bar doesn't hang around.
@@ -154,6 +166,7 @@ browserbear tabs --profile Work
 browserbear claim studio.youtube.com          # one of your open tabs, and what's on it
 browserbear open https://example.com --profile Work
 browserbear click 1234 e12
+browserbear click 1234 --text "Regular email"  # or --css "a[title=Edit]" --nth 2, for what snap can't name
 browserbear type 1234 e7 "Hello" --submit
 browserbear upload 1234 e12 ~/talk.mp3         # e12 can be the "Choose files" button
 browserbear download 1234 <url> --to ./files/  # with the tab's sign-in; prints the path

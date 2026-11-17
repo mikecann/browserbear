@@ -322,7 +322,7 @@ async function whose(tabId) {
 // Commands that change a page. Looking (snap, read, shot, eval, show) stays
 // open on any tab, unmarked on the user's own; these need the tab to be an
 // agent's, or the user's tab to have been lent with claim or --user-tab.
-const ACTS = new Set(['click', 'type', 'key', 'goto', 'upload', 'dialog', 'cdp', 'fill']);
+const ACTS = new Set(['click', 'hover', 'type', 'key', 'goto', 'upload', 'dialog', 'cdp', 'fill']);
 const NOT_YOURS = "If you meant a tab you opened, use the id browserbear open printed (open --id prints only that), not a match from browserbear tabs.";
 
 function refuseUserTab(cmd, tabId, { who, left, t }) {
@@ -370,7 +370,8 @@ const panel = createPanel({ home: HOME, profiles: () => [...profiles.values()], 
 // What the pill in an agent's tab says it's doing, per command.
 const USES = {
   snap: () => 'looking at the page',
-  click: ({ tab, ref }) => `clicking ${labelOf(tab, ref)}`,
+  click: ({ tab, ref, text }) => `clicking ${text && text !== true ? `"${String(text).slice(0, 40)}"` : labelOf(tab, ref)}`,
+  hover: () => 'pointing at something',
   type: () => 'typing',
   key: ({ key }) => `pressing ${key}`,
   goto: ({ url }) => `going to ${hostOf(url)}`,
@@ -673,7 +674,13 @@ const pageAnswers = (p, tabId) =>
 async function hitsTarget(tabId, backendNodeId, at) {
   // In a frame, asked of the frame.
   const { frame, id } = inFrame(backendNodeId) ? splitNode(backendNodeId) : { frame: null, id: backendNodeId };
-  const hit = await cdp(tabId, 'DOM.getNodeForLocation', { x: Math.round(at.x), y: Math.round(at.y), ignorePointerEventsNone: true }, undefined, frame).catch(() => null);
+  // getNodeForLocation takes a point on the page, not in the window, so a
+  // scrolled page's point is moved by its scroll. Without that, the check
+  // looked at whatever was a scroll's height above, called it on top, and
+  // turned real clicks into script clicks (17 Nov).
+  const metrics = await cdp(tabId, 'Page.getLayoutMetrics', {}, PROBE_MS, frame).catch(() => null);
+  const { pageX = 0, pageY = 0 } = metrics?.cssVisualViewport || {};
+  const hit = await cdp(tabId, 'DOM.getNodeForLocation', { x: Math.round(at.x + pageX), y: Math.round(at.y + pageY), ignorePointerEventsNone: true }, undefined, frame).catch(() => null);
   if (!hit?.backendNodeId) return { ok: false, what: 'nothing' };
   if (hit.backendNodeId === id) return { ok: true };
   const [{ object: target }, { object: top }] = await Promise.all([
@@ -921,13 +928,70 @@ async function frameTrees(tabId) {
   return docs;
 }
 
+// Drawn elements with no role of their own that the page handles clicks on,
+// for snapshot.mjs's compact to list as "clickable" (see there for why).
+// DOMSnapshot gives the lot in one call: isClickable is Chrome's own "has a
+// click, mousedown or mouseup listener, or is a link", and cursor: pointer
+// catches pages that listen once on the document (jQuery's delegated
+// handlers) instead. cursor is inherited, so only where it starts counts.
+// The tab's own process only: a cross-origin frame's controls come from its tree.
+async function clickables(tabId) {
+  const out = new Map();
+  const snap = await cdp(tabId, 'DOMSnapshot.captureSnapshot', { computedStyles: ['cursor', 'visibility'] }, PROBE_MS).catch(() => null);
+  if (!Array.isArray(snap?.documents)) return out;
+  const str = (i) => (i >= 0 ? snap.strings[i] : '');
+  for (const d of snap.documents) {
+    const n = d.nodes;
+    if (!n?.backendNodeId || !d.layout?.nodeIndex) continue;
+    const box = new Map(); // node index -> [cursor, visibility, width, height]
+    d.layout.nodeIndex.forEach((ni, li) => {
+      const [x, y, w, h] = d.layout.bounds[li];
+      box.set(ni, [str(d.layout.styles[li][0]), str(d.layout.styles[li][1]), w, h]);
+    });
+    const listens = new Set(n.isClickable?.index || []);
+    // The nearest ancestor that's drawn: one with display: contents has no box.
+    const drawnParent = (i) => {
+      for (let p = n.parentIndex[i]; p >= 0; p = n.parentIndex[p]) if (box.has(p)) return box.get(p);
+      return null;
+    };
+    const attrsOf = (i) => {
+      const attrs = {};
+      const a = n.attributes[i] || [];
+      for (let k = 0; k + 1 < a.length; k += 2) attrs[str(a[k])] = str(a[k + 1]);
+      return attrs;
+    };
+    // A label that opens a file input is already listed as that file-input.
+    const fileLabels = new Set();
+    const fileIds = new Set();
+    for (let i = 0; i < n.backendNodeId.length; i++) {
+      if (str(n.nodeName[i]) !== 'INPUT' || attrsOf(i).type?.toLowerCase() !== 'file') continue;
+      if (attrsOf(i).id) fileIds.add(attrsOf(i).id);
+      for (let p = n.parentIndex[i]; p >= 0; p = n.parentIndex[p]) if (str(n.nodeName[p]) === 'LABEL') fileLabels.add(p);
+    }
+    for (let i = 0; i < n.backendNodeId.length; i++) {
+      if (n.nodeType[i] !== 1) continue;
+      const b = box.get(i);
+      if (!b || b[1] === 'hidden' || !(b[2] > 0 && b[3] > 0)) continue;
+      const tag = str(n.nodeName[i]).toLowerCase();
+      if (tag === 'html' || tag === 'body') continue;
+      const pointerStarts = b[0] === 'pointer' && drawnParent(i)?.[0] !== 'pointer';
+      if (!listens.has(i) && !pointerStarts) continue;
+      const attrs = attrsOf(i);
+      if (tag === 'label' && (fileLabels.has(i) || fileIds.has(attrs.for))) continue;
+      const label = attrs['aria-label'] || attrs.title || attrs.alt || `${tag}${attrs.class ? '.' + attrs.class.trim().split(/\s+/)[0] : ''}`;
+      out.set(n.backendNodeId[i], { label });
+    }
+  }
+  return out;
+}
+
 async function snapshot(tabId, { full = false } = {}) {
   const s = state(tabId);
   // A JS dialog freezes the page, so every other call would just time out.
   if (s.dialog) return `tab ${tabId}\n${dialogLine(tabId, s.dialog)}`;
   await wake(tabId);
   await cdp(tabId, 'Page.enable');
-  const [{ nodes }, files, frames] = await Promise.all([cdp(tabId, 'Accessibility.getFullAXTree'), fileInputs(tabId), frameTrees(tabId)]);
+  const [{ nodes }, files, frames, clicks] = await Promise.all([cdp(tabId, 'Accessibility.getFullAXTree'), fileInputs(tabId), frameTrees(tabId), clickables(tabId)]);
   const masked = (await stillFilled(tabId)) || undefined;
   // Each cross-origin iframe's controls go where the iframe is in its parent,
   // numbered from the same refs as the page's own.
@@ -942,7 +1006,7 @@ async function snapshot(tabId, { full = false } = {}) {
     }
     const session = frame && frames.get(frame).session;
     const refs = session ? { ref: (id) => s.refs.ref(frameNode(session, id)) } : s.refs;
-    return compact(axNodes, refs, frame ? frames.get(frame).files : files, frame ? undefined : masked, inline);
+    return compact(axNodes, refs, frame ? frames.get(frame).files : files, frame ? undefined : masked, inline, session ? undefined : clicks);
   };
   const lines = linesFor(null, nodes);
   const out = full ? { full: true, text: lines.join('\n') } : diff(s.last, lines);
@@ -1062,18 +1126,29 @@ async function center(tabId, backendNodeId) {
 // event on a background tab, 29 Oct), so: BrowserBear's own tabs are brought to the
 // front of BrowserBear's window; your tabs are never pulled forward behind your back,
 // and get a script click instead, which most sites accept.
-async function clickNode(tabId, backendNodeId, { script = false, sending = () => {} } = {}) {
+// hover: move the pointer onto it first and give the page a moment, for
+// elements that only work once they've been hovered (Zoho's campaign cards).
+async function clickNode(tabId, backendNodeId, { script = false, hover = false, sending = () => {} } = {}) {
   const p = await ownerOf(tabId);
   let tab = (await call(p, 'tabs')).find((t) => t.tabId === tabId);
   if (!tab?.active && bearTabs.has(tabId)) tab = await call(p, 'show', { tabId });
   if (script) {
     sending();
+    if (hover) await scriptHover(tabId, backendNodeId);
     await scriptClick(tabId, backendNodeId);
     return '(script click, as asked)';
   }
-  const at = tab?.active ? await center(tabId, backendNodeId) : null;
+  let at = tab?.active ? await center(tabId, backendNodeId) : null;
+  if (at && hover) {
+    sending();
+    await moveTo(tabId, backendNodeId, at).catch(() => {});
+    await sleep(HOVER_MS);
+    // Hovering can move things about (a revealed button pushing its row).
+    at = await center(tabId, backendNodeId);
+  }
   if (!at) {
     sending();
+    if (hover) await scriptHover(tabId, backendNodeId);
     await scriptClick(tabId, backendNodeId);
     return tab?.active ? '' : `(tab ${tabId} is in the background, so that was a script click; browserbear show ${tabId} brings it forward for a real one)`;
   }
@@ -1102,6 +1177,237 @@ async function clickNode(tabId, backendNodeId, { script = false, sending = () =>
   }
   return '';
 }
+
+const HOVER_MS = 300;
+
+// The pointer onto a node, as the user's mouse would be. In a cross-origin
+// frame, sent to the frame at its own coordinates, as clicks are.
+function moveTo(tabId, backendNodeId, at) {
+  const frame = inFrame(backendNodeId) ? splitNode(backendNodeId).frame : null;
+  return cdp(tabId, 'Input.dispatchMouseEvent', { type: 'mouseMoved', x: at.x, y: at.y }, INPUT_WAIT_MS, frame);
+}
+
+// What a page's own handlers see of a hover, for a tab that can't take real
+// input. CSS :hover doesn't follow, so a button shown by CSS stays hidden.
+const SCRIPT_HOVER = `function () {
+  const o = { bubbles: true, cancelable: true, composed: true, view: window };
+  const p = { ...o, pointerType: 'mouse', isPrimary: true };
+  this.dispatchEvent(new PointerEvent('pointerover', p));
+  this.dispatchEvent(new PointerEvent('pointerenter', { ...p, bubbles: false }));
+  this.dispatchEvent(new MouseEvent('mouseover', o));
+  this.dispatchEvent(new MouseEvent('mouseenter', { ...o, bubbles: false }));
+  this.dispatchEvent(new PointerEvent('pointermove', p));
+  this.dispatchEvent(new MouseEvent('mousemove', o));
+}`;
+
+async function scriptHover(tabId, backendNodeId) {
+  const { object } = await cdp(tabId, 'DOM.resolveNode', { backendNodeId });
+  await cdp(tabId, 'Runtime.callFunctionOn', { objectId: object.objectId, functionDeclaration: SCRIPT_HOVER });
+}
+
+// A real hover where the tab can take one (see clickNode), else a script one.
+async function hoverNode(tabId, backendNodeId, sending = () => {}) {
+  const p = await ownerOf(tabId);
+  let tab = (await call(p, 'tabs')).find((t) => t.tabId === tabId);
+  if (!tab?.active && bearTabs.has(tabId)) tab = await call(p, 'show', { tabId });
+  const at = tab?.active ? await center(tabId, backendNodeId) : null;
+  sending();
+  if (at) {
+    try {
+      await moveTo(tabId, backendNodeId, at);
+    } catch (e) {
+      if (!/timed out/.test(e.message)) throw e;
+    }
+    return '';
+  }
+  await scriptHover(tabId, backendNodeId);
+  return tab?.active
+    ? '(it has no box to point at, so that was a script hover)'
+    : `(tab ${tabId} is in the background, so that was a script hover, which doesn't set CSS :hover; browserbear show ${tabId} brings it forward for a real one)`;
+}
+
+// Finds what click and hover were pointed at by --css or --text rather than a
+// ref, for controls a snapshot can't name. Zoho Campaigns (17 Nov): an agent
+// fell back to eval'd mouse events for divs, a hover-revealed button and
+// <a title=Edit> icons, and some of those clicks silently did nothing.
+// Returns [element, the nearest drawn ancestor of a hidden one, JSON info].
+// Open shadow roots are searched too; cross-origin frames aren't.
+const FIND = `function (css, text, nth) {
+  const tidy = (s) => String(s ?? '').replace(/\\s+/g, ' ').trim();
+  const norm = (s) => tidy(s).toLowerCase();
+  const all = (root, sel) => {
+    const out = [...root.querySelectorAll(sel)];
+    for (const el of root.querySelectorAll('*')) if (el.shadowRoot) out.push(...all(el.shadowRoot, sel));
+    return out;
+  };
+  const up = (el) => el.parentElement || el.getRootNode().host || null;
+  const drawn = (el) => {
+    const r = el.getBoundingClientRect();
+    return r.width > 0 && r.height > 0 && el.checkVisibility({ opacityProperty: true, visibilityProperty: true });
+  };
+  const clip = (t, n) => (t.length > n ? t.slice(0, n - 1) + '…' : t);
+  const said = (el) => [el.innerText, el.getAttribute('aria-label'), el.getAttribute('title'), el.getAttribute('alt'), ['submit', 'button', 'reset'].includes(el.type) ? el.value : null].map(tidy).filter(Boolean);
+  const names = (el) => said(el).map(norm);
+  // Which one it is: its own words, and those of the nearest thing around
+  // it that says more (its row, its card), since the matches all say the same.
+  const describe = (el) => {
+    let d = el.tagName.toLowerCase() + (el.id ? '#' + el.id : '') + (typeof el.className === 'string' && el.className.trim() ? '.' + el.className.trim().split(/\\s+/)[0] : '');
+    const own = said(el)[0] || '';
+    if (own) d += ' "' + clip(own, 40) + '"';
+    for (let a = up(el), i = 0; a && a !== document.body && i < 6; a = up(a), i++) {
+      const ctx = tidy(a.innerText);
+      if (ctx && ctx !== own) {
+        d += ' in "' + clip(ctx, 50) + '"';
+        break;
+      }
+    }
+    return d;
+  };
+  // Whether a holds b, across shadow roots (contains() stops at them).
+  const holds = (a, b) => {
+    for (let x = b; x; x = up(x)) if (x === a) return true;
+    return false;
+  };
+  // Only the innermost of a nest that all match, as <div><p>Save</p></div> do.
+  // One walk up from each, not every pair: a table of 10,000 "Edit"s would
+  // stall the page (Codex's review, 17 Nov).
+  const innermost = (els) => {
+    const outer = new Set();
+    for (const el of els) for (let a = up(el); a; a = up(a)) outer.add(a);
+    return els.filter((el) => !outer.has(el));
+  };
+  // Drawn ones first, so <button aria-label=Delete> isn't passed over for a
+  // hidden tooltip inside it that also says "Delete" (Codex's review).
+  const pick = (els) => {
+    const shown = els.filter(drawn);
+    return shown.length ? { els: innermost(shown), hidden: false } : { els: innermost(els), hidden: true };
+  };
+  let found;
+  let what;
+  if (css) {
+    what = 'the selector "' + css + '"';
+    try {
+      found = pick(all(document, css));
+    } catch (e) {
+      return [null, null, JSON.stringify({ error: '"' + css + '" is not a CSS selector that works: ' + e.message })];
+    }
+  } else {
+    what = 'the text "' + text + '"';
+    const want = norm(text);
+    const skip = new Set(['SCRIPT', 'STYLE', 'NOSCRIPT', 'TEMPLATE', 'HEAD', 'TITLE', 'META', 'LINK', 'HTML', 'BODY']);
+    // textContent first: it's cheaper than innerText, which lays the text out.
+    const attrs = (el) => ['aria-label', 'title', 'alt'].some((a) => norm(el.getAttribute(a)).includes(want)) || norm(el.value).includes(want);
+    // Without spaces, as layout adds some textContent hasn't got (a <br>).
+    const squash = (t) => norm(t).replace(/ /g, '');
+    const els = all(document, '*').filter((el) => !skip.has(el.tagName) && (squash(el.textContent).includes(squash(want)) || attrs(el)));
+    found = pick(els.filter((el) => names(el).includes(want)));
+    // Nothing says exactly that: then anything with it in, innermost first.
+    if (!found.els.length) found = pick(els.filter((el) => names(el).some((n) => n.includes(want))));
+  }
+  if (!found.els.length) return [null, null, JSON.stringify({ error: 'nothing in the page matches ' + what }) ];
+  let pool = found.els;
+  const hidden = found.hidden;
+  if (!hidden) {
+    // Under a dialog or overlay, only what's on top can be clicked: the
+    // dialog's own "Delete", not the row's behind it. Hit-tested through
+    // shadow roots, where elementFromPoint only gives the host.
+    const at = (x, y) => {
+      let hit = document.elementFromPoint(x, y);
+      while (hit?.shadowRoot) {
+        const inner = hit.shadowRoot.elementFromPoint(x, y);
+        if (!inner || inner === hit) break;
+        hit = inner;
+      }
+      return hit;
+    };
+    // Whether what's over a match is a backdrop over the whole page, as a
+    // modal puts up, rather than a sticky header or a tooltip over one row.
+    const backdrop = (el, hit) => {
+      for (let a = hit; a && !holds(a, el); a = up(a)) {
+        if (a.nodeType !== 1) continue;
+        // Only the part on screen: a tall side panel isn't a backdrop.
+        const r = a.getBoundingClientRect();
+        const w = Math.min(r.right, innerWidth) - Math.max(r.left, 0);
+        const h = Math.min(r.bottom, innerHeight) - Math.max(r.top, 0);
+        if (w > 0 && h > 0 && w * h >= 0.9 * innerWidth * innerHeight) return true;
+      }
+      return false;
+    };
+    const onScreen = [];
+    let behindBackdrop = false;
+    for (const el of pool) {
+      const r = el.getBoundingClientRect();
+      const x = r.left + r.width / 2, y = r.top + r.height / 2;
+      if (x < 0 || y < 0 || x > innerWidth || y > innerHeight) continue;
+      const hit = at(x, y);
+      if (!hit || holds(el, hit) || holds(hit, el)) onScreen.push(el);
+      else if (backdrop(el, hit)) behindBackdrop = true;
+    }
+    // Behind a backdrop, so what's off screen is behind it too. Anything less
+    // leaves every match in, and two is an error rather than a guess at the
+    // one in view: a wrong guess could delete the wrong row (Codex's review).
+    if (behindBackdrop && onScreen.length) pool = onScreen;
+    // In a modal dialog, it's the dialog's. :modal, as a dialog opened with
+    // show() has [open] too and leaves the page usable.
+    const modal = pool.filter((el) => { for (let a = el; a; a = up(a)) if (a.nodeType === 1 && a.matches(':modal, [aria-modal=true]')) return true; return false; });
+    if (modal.length && modal.length < pool.length) pool = modal;
+  }
+  if (nth > pool.length) return [null, null, JSON.stringify({ error: what + ' matches ' + pool.length + ', so there is no number ' + nth })];
+  if (pool.length > 1 && !nth) {
+    const list = pool.slice(0, 8).map((el, i) => '  ' + (i + 1) + '. ' + describe(el)).join('\\n');
+    return [null, null, JSON.stringify({ error: what + ' matches ' + pool.length + (hidden ? ' hidden elements' : '') + '. Say which with --nth <n>, or narrow it:\\n' + list + (pool.length > 8 ? '\\n  ...' : '') })];
+  }
+  const el = pool[(nth || 1) - 1];
+  let revealer = null;
+  if (hidden) for (let a = up(el); a && !revealer; a = up(a)) if (a.nodeType === 1 && drawn(a)) revealer = a;
+  return [el, revealer, JSON.stringify({ desc: describe(el), revealer: revealer && describe(revealer), hidden })];
+}`;
+
+const isRef = (target) => /^e\d+$/.test(target);
+
+// The node a click or hover means: a ref from a snapshot, or one found by
+// --css or --text, which then gets a ref of its own for next time. A hidden
+// match (a button that only shows while its card is hovered) is revealed by
+// hovering the nearest ancestor that's drawn.
+async function resolveTarget(tabId, { ref, css, text, nth }, sending) {
+  if (css === true || text === true) throw new Error(`--${css === true ? 'css' : 'text'} needs a value`);
+  if (nth !== undefined && !(Number.isInteger(nth) && nth > 0)) throw new Error('--nth takes a number from 1');
+  if (ref && isRef(ref) && !css && !text) return { node: await nodeFor(tabId, ref), ref, note: '' };
+  // A selector where the ref goes, as upload takes one.
+  if (ref && !css && !text) css = ref;
+  if (!css && !text) throw new Error('say what to act on: a ref from browserbear snap (e12), --css <selector> or --text <text>');
+  const group = 'browserbear-find';
+  try {
+    const r = await cdp(tabId, 'Runtime.evaluate', { expression: `(${FIND})(${JSON.stringify(css || null)}, ${JSON.stringify(text || null)}, ${nth || 0})`, objectGroup: group });
+    if (r.exceptionDetails) throw new Error(r.exceptionDetails.exception?.description || r.exceptionDetails.text);
+    const { result: props } = await cdp(tabId, 'Runtime.getProperties', { objectId: r.result.objectId, ownProperties: true });
+    const slot = (k) => props.find((p) => p.name === k)?.value;
+    const info = JSON.parse(slot('2').value);
+    if (info.error) throw new Error(`in tab ${tabId}, ${info.error}`);
+    const backendOf = async (o) => (o?.objectId ? (await cdp(tabId, 'DOM.describeNode', { objectId: o.objectId })).node.backendNodeId : null);
+    const node = await backendOf(slot('0'));
+    const named = state(tabId).refs.ref(node);
+    if (!info.hidden) return { node, ref: named, note: `(${named} is ${info.desc})` };
+    const revealer = await backendOf(slot('1'));
+    if (!revealer) throw new Error(`in tab ${tabId}, ${info.desc} is hidden, and nothing around it is drawn to hover over`);
+    const how = await hoverNode(tabId, revealer, sending);
+    await sleep(HOVER_MS);
+    const { object } = await cdp(tabId, 'DOM.resolveNode', { backendNodeId: node });
+    const { result } = await cdp(tabId, 'Runtime.callFunctionOn', {
+      objectId: object.objectId,
+      functionDeclaration: `function () { const r = this.getBoundingClientRect(); return r.width > 0 && r.height > 0 && this.checkVisibility({ opacityProperty: true, visibilityProperty: true }); }`,
+      returnByValue: true,
+    });
+    if (!result.value) throw new Error(`in tab ${tabId}, ${info.desc} is hidden, and hovering over ${info.revealer} didn't show it${how ? ` ${how}` : ''}`);
+    return { node, ref: named, note: `(${named} is ${info.desc}; it showed once the pointer was over ${info.revealer})` };
+  } finally {
+    cdp(tabId, 'Runtime.releaseObjectGroup', { objectGroup: group }).catch(() => {});
+  }
+}
+
+// Whether a ref's line in the last snapshot was a plain clickable element,
+// which may want hovering before it takes a click.
+const listedClickable = (tabId, ref) => !!state(tabId).last?.some((l) => l.startsWith(`${ref} clickable`));
 
 // The full pointer sequence, not just click(): menus and comboboxes (Base UI,
 // Radix) open on pointerdown and ignore a bare click event.
@@ -1202,8 +1508,6 @@ const NEAREST_FILE_INPUT = `function () {
   }
   return null;
 }`;
-
-const isRef = (target) => /^e\d+$/.test(target);
 
 // A ref from a snapshot, or a CSS selector (for a page you've read the
 // source of); either way a remote object to work on.
@@ -1960,13 +2264,17 @@ const commands = {
 
   snap: ({ tab, full }) => snapshot(tab, { full }),
 
-  click: ({ tab, ref, script }) =>
+  click: ({ tab, ref: given, css, text, nth, script }) =>
     orClosed(tab, async (sending) => {
-      const node = await nodeFor(tab, ref);
       const before = state(tab).last;
       const startUrl = (await tabNow(tab))?.url;
+      const found = await resolveTarget(tab, { ref: given, css, text, nth }, sending);
+      const { node, ref } = found;
+      // Found by --css or --text, or listed as a plain clickable: a <div> may
+      // only take clicks once it's hovered, as the user's mouse would have.
+      const hover = !!(css || text || !isRef(given)) || listedClickable(tab, ref);
       await markPage(tab);
-      const note = await clickNode(tab, node, { script, sending });
+      const note = [found.note, await clickNode(tab, node, { script, hover, sending })].filter(Boolean).join('\n');
       await settleAfterAction(tab);
       let out = await snapshot(tab);
       // A new address counts by itself: history.pushState can leave every control as it was.
@@ -1992,6 +2300,16 @@ const commands = {
       // A click that changed nothing visible is often one the page ignored.
       if (unchanged) out += `\n(if that click should have done something: browserbear click ${tab} ${ref} --script)`;
       return (note ? note + '\n' : '') + out;
+    }),
+
+  hover: ({ tab, ref: given, css, text, nth }) =>
+    orClosed(tab, async (sending) => {
+      const found = await resolveTarget(tab, { ref: given, css, text, nth }, sending);
+      await markPage(tab);
+      const note = [found.note, await hoverNode(tab, found.node, sending)].filter(Boolean).join('\n');
+      await sleep(HOVER_MS);
+      await settleAfterAction(tab);
+      return (note ? note + '\n' : '') + (await snapshot(tab));
     }),
 
   type: ({ tab, ref, text, submit, replace }) =>

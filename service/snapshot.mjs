@@ -67,10 +67,25 @@ function fileInputLine(ref, f, axName, hidden) {
   return text;
 }
 
+// What a plain clickable element says: the text under it in the tree, as a
+// <div> has no accessible name of its own.
+function textUnder(node, byId, depth = 0) {
+  if (!node || depth > 12) return '';
+  if (node.role?.value === 'StaticText') return node.name?.value || '';
+  return (node.childIds || []).map((id) => textUnder(byId.get(id), byId, depth + 1)).join(' ');
+}
+
 // fileInputs: backendDOMNodeId -> { id, label, accept, multiple, disabled }
 // frames: backendDOMNodeId of an <iframe> -> the lines for what's inside it,
 // put in where the iframe is (a cross-origin one isn't in this tree).
-export function compact(axNodes, refs, fileInputs = new Map(), masked = new Set(), frames = new Map()) {
+// clickable: backendDOMNodeId -> { label } for drawn elements with no role of
+// their own that the page handles clicks on (a click listener, or where
+// cursor: pointer starts). Zoho Campaigns builds its campaign-type cards,
+// dropdowns and icon links out of <div>, <p> and <a> with no href (17 Nov), so
+// without these an agent had nothing to click. Only the innermost is listed,
+// and none that holds a real control, so a React root (which listens for
+// every click) or a card around its own button doesn't swallow what's inside.
+export function compact(axNodes, refs, fileInputs = new Map(), masked = new Set(), frames = new Map(), clickable = new Map()) {
   const byId = new Map(axNodes.map((n) => [n.nodeId, n]));
   const root = axNodes.find((n) => !n.parentId) || axNodes[0];
   const lines = [];
@@ -78,7 +93,28 @@ export function compact(axNodes, refs, fileInputs = new Map(), masked = new Set(
   const shown = new Set(); // file inputs the tree already had
   const placed = new Set(); // frames put in where they are
 
-  const walk = (node) => {
+  // aria-hidden says a page doesn't mean it for anyone to use, and BrowserBear's
+  // own pill in the tab is hidden that way.
+  const ariaHidden = (n) => n.ignoredReasons?.some((r) => r.name === 'ariaHiddenElement' || r.name === 'ariaHiddenSubtree');
+  const isControl = (n) => !n.ignored && INTERACTIVE.has(n.role?.value) && n.backendDOMNodeId;
+  // Whether anything under a node is a control or another clickable element.
+  const holds = new Map();
+  const holdsAction = (node, depth = 0) => {
+    if (!node || depth > 400) return false;
+    if (holds.has(node.nodeId)) return holds.get(node.nodeId);
+    holds.set(node.nodeId, false); // a cycle can't hold anything
+    let any = false;
+    for (const id of node.childIds || []) {
+      const c = byId.get(id);
+      if (!c) continue;
+      // Every child is visited, so each one's answer is cached for the walk.
+      if (holdsAction(c, depth + 1) || isControl(c) || clickable.has(c.backendDOMNodeId) || frames.has(c.backendDOMNodeId)) any = true;
+    }
+    holds.set(node.nodeId, any);
+    return any;
+  };
+
+  const walk = (node, inControl = false) => {
     if (!node || seen.has(node.nodeId)) return;
     seen.add(node.nodeId);
     const role = node.role?.value;
@@ -87,7 +123,12 @@ export function compact(axNodes, refs, fileInputs = new Map(), masked = new Set(
       placed.add(node.backendDOMNodeId);
       lines.push(...frames.get(node.backendDOMNodeId));
     }
-    if (!node.ignored) {
+    let control = inControl;
+    if (!isControl(node) && !inControl && clickable.has(node.backendDOMNodeId) && !ariaHidden(node) && !fileInputs.has(node.backendDOMNodeId) && !holdsAction(node)) {
+      const text = name || clip(textUnder(node, byId)) || clip(clickable.get(node.backendDOMNodeId).label);
+      lines.push(`${refs.ref(node.backendDOMNodeId)} clickable${text ? ` "${text}"` : ''}`);
+      control = true;
+    } else if (!node.ignored) {
       if (fileInputs.has(node.backendDOMNodeId)) {
         shown.add(node.backendDOMNodeId);
         lines.push(fileInputLine(refs.ref(node.backendDOMNodeId), fileInputs.get(node.backendDOMNodeId), name, false));
@@ -108,9 +149,10 @@ export function compact(axNodes, refs, fileInputs = new Map(), masked = new Set(
         });
         if (flags.length) text += ` [${flags.join(', ')}]`;
         lines.push(text);
+        control = true;
       }
     }
-    for (const id of node.childIds || []) walk(byId.get(id));
+    for (const id of node.childIds || []) walk(byId.get(id), control);
   };
   walk(root);
   // A frame whose iframe the tree doesn't show still has controls worth listing.
