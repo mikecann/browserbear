@@ -447,18 +447,16 @@ async function cdp(tabId, method, params, timeoutMs = CDP_WAIT_MS, frame = null)
     frame = n.frame;
     params = { ...params, backendNodeId: n.id };
   } else if (params?.objectId || params?.arguments) {
-    // callFunctionOn's arguments can be objects too, from the same frame.
-    const own = splitObject(params.objectId);
-    frame = own.frame || frame;
-    params = { ...params, ...(params.objectId ? { objectId: own.id } : {}) };
-    if (Array.isArray(params.arguments)) {
-      params.arguments = params.arguments.map((a) => {
-        if (!a?.objectId) return a;
-        const arg = splitObject(a.objectId);
-        frame ||= arg.frame;
-        return { ...a, objectId: arg.id };
-      });
-    }
+    // callFunctionOn's arguments can be objects too. They all have to live
+    // where its target does: as ids repeat across processes, unwrapping a
+    // mix and sending it to one session would quietly act on some other
+    // object there. An untagged id is the page's, or the frame passed in.
+    const ids = [params.objectId, ...(Array.isArray(params.arguments) ? params.arguments.map((a) => a?.objectId) : [])].filter(Boolean);
+    const homes = new Set(ids.map((id) => splitObject(id).frame || frame));
+    if (homes.size > 1) throw new Error(`BrowserBear bug: ${method} was given objects from different frames of tab ${tabId}`);
+    if (homes.size) frame = [...homes][0];
+    params = { ...params, ...(params.objectId ? { objectId: splitObject(params.objectId).id } : {}) };
+    if (Array.isArray(params.arguments)) params.arguments = params.arguments.map((a) => (a?.objectId ? { ...a, objectId: splitObject(a.objectId).id } : a));
   }
   try {
     if (!frame) return await send(p, tabId, method, params, timeoutMs);
@@ -525,10 +523,15 @@ async function sendToFrame(p, tabId, frame, method, params, timeoutMs) {
 }
 
 // Tags each object id in a frame's reply with the frame (see frameObject).
+// A RemoteObject (it has a type) gets its objectId tagged, but its value is
+// the page's own data returned by value, which may well have an "objectId"
+// key of its own, so it isn't gone into. A property descriptor's value is a
+// RemoteObject, and has no type of its own, so that one is.
 function markObjects(frame, result, depth = 0) {
   if (!result || typeof result !== 'object' || depth > 4) return;
-  if (typeof result.objectId === 'string' && !result.objectId.includes('@')) result.objectId = frameObject(frame, result.objectId);
-  for (const v of Array.isArray(result) ? result : Object.values(result)) markObjects(frame, v, depth + 1);
+  const remote = !Array.isArray(result) && typeof result.type === 'string';
+  if (remote && typeof result.objectId === 'string' && !result.objectId.includes('@')) result.objectId = frameObject(frame, result.objectId);
+  for (const [k, v] of Object.entries(result)) if (!(remote && k === 'value')) markObjects(frame, v, depth + 1);
 }
 
 // Brings a frame on screen, outermost iframe first, so a person watching
