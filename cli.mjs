@@ -39,7 +39,7 @@ const USAGE = `browserbear: let agents use your real Chrome profiles
   browserbear goto <tab> <url>
   browserbear read <tab>                        the page's text
   browserbear shot <tab> [file]                 screenshot, prints the PNG path
-  browserbear eval <tab> <js>
+  browserbear eval <tab> <js>                   the result alone on stdout; notes go to stderr
   browserbear upload <tab> <ref|selector> <file...>
                                                 the file input, or the button or label that opens one
                                                 ("Choose files"); snap lists hidden inputs as file-input
@@ -51,6 +51,10 @@ const USAGE = `browserbear: let agents use your real Chrome profiles
                                                 page saved as text/html means the link needed more than the cookies
   browserbear dialog <tab> accept|dismiss [text]
   browserbear show <tab>                        bring a tab forward in its window (real clicks need it)
+                                                A tab behind another is hidden, and Chrome slows its timers, so
+                                                pages that draw on them load slowly. Every command wakes an agent's
+                                                tab without bringing anything forward; one of the user's own stays
+                                                hidden, and says so on stderr, until show
   browserbear handoff <tab|url>                 before asking the user to do something in a tab (sign in,
                                                 pay, approve): brings the tab's window to the front, in their own
                                                 Chrome or the agents' browser. A URL finds the agent tab on that page.
@@ -162,6 +166,8 @@ function request(msg, { attempt = 0 } = {}) {
       lineReader((reply) => {
         answered = true;
         s.end();
+        // A note goes to stderr, so it never mixes into what eval returns.
+        if (reply.note) console.error(`browserbear: ${reply.note}`);
         reply.ok ? resolve(reply.result) : reject(new Error(reply.error));
       }),
     );

@@ -44,7 +44,9 @@ test('a stuck tab says why, and a link that ignores a real click gets a script o
   const { browserbear } = await startBear(
     t,
     async ({ op, args }) => {
-      if (op === 'tabs') return [{ tabId: 1, url, title: 'BTC', active: true }];
+      // An agent's tab: on one of the user's, raw cdp first turns focus emulation off,
+      // and that is what would find the session stuck.
+      if (op === 'tabs') return [{ tabId: 1, url, title: 'BTC', active: true, agent: true, bear: true }];
       if (op === 'detach') {
         detaches.push(args.tabId);
         sessionStuck = false;
@@ -65,10 +67,14 @@ test('a stuck tab says why, and a link that ignores a real click gets a script o
   sessionStuck = true;
   assert.match(await browserbear('snap', '1', '--full'), /SELL BTC/);
   assert.deepEqual(detaches, [1]);
-  // ...and on one that might have done something: a fresh session, but not resent.
+  // ...and on one that might have done something: a fresh session, but not
+  // resent. Raw cdp, as eval now looks first (is the tab hidden?), and that
+  // look is what finds the session stuck and starts a fresh one.
   sessionStuck = true;
-  await assert.rejects(browserbear('eval', '1', 'document.title'), /debugger session was stuck, so BrowserBear started a fresh one; Runtime.evaluate may or may not have run/);
+  await assert.rejects(browserbear('cdp', '1', 'Runtime.evaluate', '{"expression":"document.title"}'), /debugger session was stuck, so BrowserBear started a fresh one; Runtime.evaluate may or may not have run/);
+  sessionStuck = true;
   assert.equal(await browserbear('eval', '1', 'document.title'), 'BTC');
+  assert.deepEqual(detaches, [1, 1, 1]);
 
   // A slow promise isn't a stuck page.
   await assert.rejects(browserbear('eval', '1', 'new Promise((r) => setTimeout(r, 3000))'), /the page still answers, so it's that command that's slow/);
@@ -88,5 +94,5 @@ test('a stuck tab says why, and a link that ignores a real click gets a script o
     await assert.rejects(browserbear(...args), /page isn't answering/);
     assert.ok(Date.now() - at < 6000, `${args[0]} took ${Date.now() - at} ms`);
   }
-  assert.deepEqual(detaches, [1, 1]);
+  assert.deepEqual(detaches, [1, 1, 1]);
 });

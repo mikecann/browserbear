@@ -189,6 +189,15 @@ a sign-in. Given a URL, `handoff` finds the agent tab on that page; Threadbear
 does that when you click a link an agent gave you, so you don't end up with
 two tabs of the same sign-in.
 
+A tab behind another one, or in a window you've covered, is hidden to Chrome,
+which then slows the page's timers to once a second, and to once a minute after
+five minutes. Apps that draw on timers crawl: YouTube Studio's analytics took a
+minute a page instead of 8 s. So before each command BrowserBear has an agent's
+hidden tab treat itself as in front (Chrome's focus emulation, which brings no
+window forward). Your own tabs are left hidden, since one that thinks it has
+focus could mark your messages read; a command on one says so on stderr, and
+`show` brings it forward in its window.
+
 Your own tabs stay yours. An agent can look at one (`snap`, `read`, `shot`,
 `eval`, `show`) without it getting marked, but `click`, `type`, `key`, `goto`,
 `upload`, `dialog` and `cdp` refuse a tab no agent opened until it's lent with

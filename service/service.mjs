@@ -365,7 +365,11 @@ const marks = createMarks({
   log,
 });
 
-const panel = createPanel({ home: HOME, profiles: () => [...profiles.values()], call, mark: tabId => marks.get(tabId) });
+// beforeStill: the panel's stills keep the debugger on a tab, so one an agent
+// woke and the user then dragged into their window loses its emulation first
+// (Codex's review).
+const panel = createPanel({ home: HOME, profiles: () => [...profiles.values()], call, mark: tabId => marks.get(tabId),
+  beforeStill: async (tabId) => unlessAgents(tabId, await whose(tabId)) });
 
 // What the pill in an agent's tab says it's doing, per command.
 const USES = {
@@ -650,7 +654,7 @@ const stuckError = (tabId, url) =>
   Object.assign(
     new Error(
       url
-        ? `tab ${tabId}'s page isn't answering: Chrome is fine, but the page's own scripts are stuck or flat out (a live chart can do this). Try again in a bit, or open it fresh in a new tab: browserbear open ${url}`
+        ? `tab ${tabId}'s page isn't answering: Chrome is fine, but the page's own scripts are stuck or flat out (a live chart can do this). Try again in a bit, or close it and open the page fresh in a new tab: browserbear close ${tabId}; browserbear open ${url}`
         // Never got as far as a page at all: its renderer didn't start.
         : `tab ${tabId} never got a page to load in, so the browser couldn't start one for it; close it and open the page again in a new tab: browserbear close ${tabId}; browserbear open <url>`,
     ),
@@ -789,17 +793,66 @@ async function inProcessFileInputs(tabId, id, doc) {
 // attached, and the extension detaches after 30 s idle, so it's checked before
 // every look. Only agents' tabs: one of your own pages thinking it has focus
 // could, say, mark your messages read.
-async function wake(tabId) {
-  if (state(tabId).dialog) return;
-  const visibility = await evaluate(tabId, 'document.visibilityState').catch(unlessStuck);
-  if (visibility !== 'hidden') return;
-  if (!bearTabs.has(tabId)) {
-    const tab = (await call(await ownerOf(tabId), 'tabs')).find((t) => t.tabId === tabId);
-    if (!tab?.agent) return;
+//
+// Hidden also means Chrome throttles the page's timers (once a second, then
+// once a minute after 5 minutes), and single-page apps render on timers:
+// YouTube Studio took a minute a page in a tab behind another, 8 s in front
+// (17 Nov). Focus emulation lifts that too, but only while the debugger is
+// attached, so every command on a tab wakes it first (onClientMessage), not
+// just the looks: an eval loop polling for a table never got woken.
+// Returns true when the tab is hidden and left so (not the agent's).
+// draw: false skips waiting for what it held back, for commands that act
+// rather than look: a click held up to 6 s behind a busy page could miss
+// what it was for (Codex's review). The snapshot after it waits instead.
+async function wake(tabId, { draw = true, owner } = {}) {
+  // Whose it is now, not whether an agent once opened it: one dragged into
+  // the user's own window, or handed to them, is theirs (Codex's review).
+  // Not knowing (the tab list didn't have it yet) means not emulating, rather
+  // than failing the command over it.
+  owner ??= await whose(tabId).catch(() => ({ who: null }));
+  const look = () => evaluate(tabId, 'document.visibilityState').catch(unlessStuck);
+  if (!agentsNow(owner)) {
+    // Off every time, not just when BrowserBear remembers turning it on: a
+    // restarted service forgets, and the debugger can outlive it (Codex's
+    // review). Before the look, which emulation would answer "visible".
+    await unlessAgents(tabId, owner, { always: true });
+    // A JS dialog freezes the page, so there's no looking until it's answered.
+    return !state(tabId).dialog && (await look()) === 'hidden';
   }
-  await cdp(tabId, 'Emulation.setFocusEmulationEnabled', { enabled: true });
-  await drawn(tabId); // what it held back
+  if (state(tabId).dialog || (await look()) !== 'hidden') return false;
+  await emulateFocus(tabId);
+  if (draw) await drawn(tabId); // what it held back
+  return false;
 }
+
+// whose() counts a tab as the agent's on the word of an extension too old to
+// say (no bear field); an explicit agent: false never is (Codex's review).
+const agentsNow = (owner) => owner.who === 'agent' && owner.t.agent !== false;
+// Tabs BrowserBear has turned focus emulation on in, so that one which has
+// since become the user's (dragged into their window mid-loop) has it turned
+// off before the next command, even one refused for being on their tab.
+const emulated = new Set();
+async function emulateFocus(tabId) {
+  await cdp(tabId, 'Emulation.setFocusEmulationEnabled', { enabled: true });
+  emulated.add(tabId);
+}
+async function unlessAgents(tabId, owner, { always = false } = {}) {
+  if (agentsNow(owner) || !(always || emulated.has(tabId))) return;
+  // Forgotten only once it's really off, so a failed try is tried again.
+  await cdp(tabId, 'Emulation.setFocusEmulationEnabled', { enabled: false }).then(
+    () => emulated.delete(tabId),
+    () => {},
+  );
+}
+
+// Commands that wake the tab before they run. snap, read, shot and open wake
+// it themselves as well, at the point they look. goto is handled apart, in
+// onClientMessage. show brings it forward anyway; dialog and fill work on a
+// page that's waiting on them.
+const WAKES = new Set(['eval', 'click', 'hover', 'type', 'key', 'upload', 'snap', 'read', 'shot']);
+const LOOKS_FIRST = new Set(['snap', 'read', 'shot']);
+const hiddenNote = (tabId) =>
+  `note: tab ${tabId} is hidden (behind another tab or window), so Chrome slows its timers and pages that draw on them (YouTube Studio's analytics) can take a minute to fill in. It's one of the user's own tabs, so BrowserBear doesn't make it think it's in front; browserbear show ${tabId} brings it forward in its window.`;
 
 // Loaded isn't drawn: an app like YouTube Studio fetches and draws its
 // reports for another 2-3 s after readyState is complete, and a read straight
@@ -2331,6 +2384,9 @@ const commands = {
       return `several tabs match; pick one by id:\n${hits.map(({ p, t }) => `  ${t.tabId} [${describe(p)}] ${t.title.slice(0, 60)} <${t.url.slice(0, 100)}>`).join('\n')}`;
     }
     claimed.add(hits[0].t.tabId);
+    // Before the snapshot, which stops short at a JS dialog: a tab an agent
+    // woke and the user then dragged out is theirs now (Codex's review).
+    await unlessAgents(hits[0].t.tabId, { who: 'claimed', t: hits[0].t });
     marks.used(hits[0].t.tabId, thread, 'looking at the page');
     panel.remember(hits[0].t.tabId, thread, hits[0].p.instance);
     return snapshot(hits[0].t.tabId);
@@ -2917,12 +2973,13 @@ async function onClientMessage(conn, msg) {
     // Left as text when it isn't a number: handoff also takes a URL.
     if (/^\d+$/.test(String(args.tab))) args.tab = Number(args.tab);
     // reload with no profile only reloads the extension where it's running.
-    if (['eval', 'cdp'].includes(msg.cmd) && typeof args.tab === 'number' && (await stillFilled(args.tab))) {
-      throw new Error(`${msg.cmd} is off in tab ${args.tab} until it leaves the page fill signed in on, so what was filled can't be read back. snap, click and key still work`);
-    }
     if (agentOnlyOn() && !['status', 'profiles'].includes(msg.cmd) && !(msg.cmd === 'reload' && !args.profile)) await keepToAgentChrome(msg.cmd, args);
+    let owner = null;
     if (typeof args.tab === 'number' && (USES[msg.cmd] || msg.cmd === 'close')) {
-      const owner = await whose(args.tab);
+      owner = await whose(args.tab);
+      // Before any refusal below: a tab that's become the user's loses the
+      // emulation even when the command on it is refused (Codex's review).
+      await unlessAgents(args.tab, owner);
       // Only a tab known to be an agent's closes without asking. Commands that
       // change a page still go through on an extension too old to say whose a
       // tab is (before 0.3.5), as they always have.
@@ -2941,7 +2998,25 @@ async function onClientMessage(conn, msg) {
         marks.begin(using, msg.thread, USES[msg.cmd](args));
       }
     }
-    conn.write(line({ id: msg.id, ok: true, result: await fn(args) }));
+    // Raw cdp that got past the refusals talks to the page anyway, so it turns
+    // it off whether or not this service remembers turning it on (one
+    // restarted since, Codex's review). A refused one never touches the page.
+    if (msg.cmd === 'cdp' && owner) await unlessAgents(args.tab, owner, { always: true });
+    // After the ownership checks, so a tab that's become the user's loses its
+    // emulation even on a page eval is off on (Codex's review).
+    if (['eval', 'cdp'].includes(msg.cmd) && typeof args.tab === 'number' && (await stillFilled(args.tab))) {
+      throw new Error(`${msg.cmd} is off in tab ${args.tab} until it leaves the page fill signed in on, so what was filled can't be read back. snap, click and key still work`);
+    }
+    let note;
+    if (typeof args.tab === 'number' && WAKES.has(msg.cmd)) {
+      if (await wake(args.tab, { draw: LOOKS_FIRST.has(msg.cmd), owner })) note = hiddenNote(args.tab);
+    } else if (typeof args.tab === 'number' && msg.cmd === 'goto' && owner && agentsNow(owner)) {
+      // So the next page loads unthrottled. Straight to Chrome, with no look at
+      // the page first: goto is the way out of a page that's stuck, and a look
+      // would wait 20 s on it and then block the navigation (Codex's review).
+      await emulateFocus(args.tab).catch(() => {});
+    }
+    conn.write(line({ id: msg.id, ok: true, result: await fn(args), note }));
   } catch (e) {
     conn.write(line({ id: msg.id, ok: false, error: e.message }));
   } finally {

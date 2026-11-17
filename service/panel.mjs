@@ -15,7 +15,7 @@ const AGENT = 'agent-chrome';
 // bar up, so those are taken far less often, and never once he has the tab.
 const FRESH_MS = { agent: 3_000, chrome: 20_000 };
 
-export function createPanel({ home, profiles, call, mark }) {
+export function createPanel({ home, profiles, call, mark, beforeStill = async () => {} }) {
   const file = path.join(home, 'panel-tabs.json');
   let saved = [];
   try { saved = JSON.parse(fs.readFileSync(file, 'utf8')); } catch {}
@@ -68,6 +68,7 @@ export function createPanel({ home, profiles, call, mark }) {
   }
 
   async function takeStill(own, profile, width) {
+    await beforeStill(own.tabId).catch(() => {});
     if (profile.instance === AGENT) return call(profile, 'still', { tabId: own.tabId, width }, 10_000);
     const metrics = await call(profile, 'cdp', { tabId: own.tabId, method: 'Page.getLayoutMetrics', params: {} }, 5_000);
     const view = metrics.cssVisualViewport || metrics.visualViewport;
