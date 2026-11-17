@@ -534,7 +534,40 @@ async function refusal(p, tabId) {
   return Object.assign(new Error(`${why}. ${wayOut(tabId)}`), { refused: true });
 }
 
+// Chrome shows one "BrowserBear started debugging this browser" bar for the
+// extension across every profile (it's keyed by extension id), and closes it the
+// moment any tab can't take it, which detaches every BrowserBear session there is
+// with canceled_by_user. Another profile's window opening did that, so each
+// attach was cut off as it was made, for a minute at a time (Zoho, 17 Nov 2026:
+// every burst of those in the log follows the cannstudios profile opening).
+// "Not attached" means the command never reached the page, so it's safe to send
+// again; the extension attaches afresh on the next one, as its onDetach forgot
+// the old session.
+const CUT_OFF = /Debugger is not attached/;
+const CUT_OFF_WAIT_MS = Number(process.env.BROWSERBEAR_CUT_OFF_WAIT_MS) || 20_000;
+
 async function send(p, tabId, method, params, timeoutMs) {
+  for (const until = Date.now() + CUT_OFF_WAIT_MS; ; ) {
+    try {
+      return await sendOnce(p, tabId, method, params, timeoutMs);
+    } catch (e) {
+      if (!CUT_OFF.test(e.message)) throw e;
+      if (Date.now() >= until) throw cutOffError(tabId, e);
+      await sleep(500);
+    }
+  }
+}
+
+// cutOff: the waits for a page to load or draw stop at this rather than wait
+// out the same 20 s again.
+function cutOffError(tabId, e) {
+  const why = state(tabId).cutOffAt
+    ? `Chrome kept cutting BrowserBear's debugger off from tab ${tabId} as it attached (canceled_by_user, for ${Math.round(CUT_OFF_WAIT_MS / 1000)} s). Chrome does that to every BrowserBear session when one of its windows can't show the "started debugging this browser" bar, usually another Chrome profile's window that has just opened`
+    : `BrowserBear's debugger kept losing tab ${tabId} (${e.message}) for ${Math.round(CUT_OFF_WAIT_MS / 1000)} s`;
+  return Object.assign(new Error(`${why}. The page itself is fine and it usually clears within a minute: try again shortly, or close any Chrome window that's just opened`), { cutOff: true });
+}
+
+async function sendOnce(p, tabId, method, params, timeoutMs) {
   // Input has its own short wait, where running out means "probably landed".
   if (method.startsWith('Input.')) return call(p, 'cdp', { tabId, method, params }, timeoutMs);
   // Browser-side recovery must still work when the page's JavaScript is stuck.
@@ -1709,13 +1742,13 @@ async function evaluate(tabId, expression) {
 // For the waits on a page to load: a refusal, a closed tab or a stuck page
 // won't get better by trying again.
 const unlessRefused = (e) => {
-  if (e.refused || e.closed || e.stuck) throw e;
+  if (e.refused || e.closed || e.stuck || e.cutOff) throw e;
   return null;
 };
 // For the looks that are only nice to have (is it drawn yet?): anything but a
 // stuck page is shrugged off.
 const unlessStuck = (e) => {
-  if (e.stuck) throw e;
+  if (e.stuck || e.cutOff) throw e;
   return null;
 };
 
@@ -2287,6 +2320,8 @@ function onHostMessage(profile, msg) {
     }
     if (msg.event === 'dialogClosed') state(msg.tabId).dialog = null; // you answered it yourself
     if (msg.event === 'detached') log('detached', msg.tabId, msg.reason);
+    // See send(): what an error after this can say happened.
+    if (msg.event === 'detached' && msg.reason === 'canceled_by_user') state(msg.tabId).cutOffAt = Date.now();
     if (msg.event === 'detached') state(msg.tabId).dialog = null;
     // The buttons on the pill in an agent's tab.
     if (msg.event === 'mark' && msg.action === 'open') marks.open(msg.tabId);
