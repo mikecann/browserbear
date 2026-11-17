@@ -406,9 +406,8 @@ function hostOf(url) {
 }
 
 const state = (tabId) => {
-  // frames: the tab's cross-origin iframes by targetId, as loadFrames last saw
-  // them; objects: which frame a remote object id came from (objectId -> targetId).
-  if (!tabState.has(tabId)) tabState.set(tabId, { refs: new RefMap(), last: null, dialog: null, frames: new Map(), objects: new Map() });
+  // frames: the tab's cross-origin iframes by targetId, as loadFrames last saw them.
+  if (!tabState.has(tabId)) tabState.set(tabId, { refs: new RefMap(), last: null, dialog: null, frames: new Map() });
   return tabState.get(tabId);
 };
 
@@ -428,21 +427,43 @@ const splitNode = (node) => {
   return { frame: node.slice(0, i), id: Number(node.slice(i + 1)) };
 };
 
+// Remote objects made in a cross-origin frame live in its process, so later
+// commands on them have to go there too. From Chrome 159 object ids are only
+// unique within a process (the page and a frame can both have "0.1.1"), so a
+// lookup by id alone sent the page's objects to the frame. Instead, an object
+// from a frame is handed out as "<frame targetId>@<objectId>", like nodes
+// above, and cdp unwraps it. Chrome's ids never have an "@" in them.
+const frameObject = (frame, id) => `${frame}@${id}`;
+const splitObject = (id) => {
+  const i = typeof id === 'string' ? id.lastIndexOf('@') : -1;
+  return i < 0 ? { frame: null, id } : { frame: id.slice(0, i), id: id.slice(i + 1) };
+};
+
 // `frame` says which iframe a command without a node or object in it is for.
 async function cdp(tabId, method, params, timeoutMs = CDP_WAIT_MS, frame = null) {
   const p = await ownerOf(tabId);
-  const s = state(tabId);
   if (inFrame(params?.backendNodeId)) {
     const n = splitNode(params.backendNodeId);
     frame = n.frame;
     params = { ...params, backendNodeId: n.id };
-  } else if (!frame && params?.objectId) {
-    frame = s.objects.get(params.objectId) || null;
+  } else if (params?.objectId || params?.arguments) {
+    // callFunctionOn's arguments can be objects too, from the same frame.
+    const own = splitObject(params.objectId);
+    frame = own.frame || frame;
+    params = { ...params, ...(params.objectId ? { objectId: own.id } : {}) };
+    if (Array.isArray(params.arguments)) {
+      params.arguments = params.arguments.map((a) => {
+        if (!a?.objectId) return a;
+        const arg = splitObject(a.objectId);
+        frame ||= arg.frame;
+        return { ...a, objectId: arg.id };
+      });
+    }
   }
   try {
     if (!frame) return await send(p, tabId, method, params, timeoutMs);
     const result = await sendToFrame(p, tabId, frame, method, params, timeoutMs);
-    noteObjects(s, frame, result);
+    markObjects(frame, result);
     return result;
   } catch (e) {
     // A ref from before the tab went to another page, which Chrome only
@@ -503,15 +524,11 @@ async function sendToFrame(p, tabId, frame, method, params, timeoutMs) {
   });
 }
 
-// Remote objects made in a frame live there, so later commands on them
-// (callFunctionOn with an objectId) have to go there too.
-function noteObjects(s, frame, result, depth = 0) {
+// Tags each object id in a frame's reply with the frame (see frameObject).
+function markObjects(frame, result, depth = 0) {
   if (!result || typeof result !== 'object' || depth > 4) return;
-  if (typeof result.objectId === 'string') {
-    if (s.objects.size > 5000) s.objects.clear();
-    s.objects.set(result.objectId, frame);
-  }
-  for (const v of Array.isArray(result) ? result : Object.values(result)) noteObjects(s, frame, v, depth + 1);
+  if (typeof result.objectId === 'string' && !result.objectId.includes('@')) result.objectId = frameObject(frame, result.objectId);
+  for (const v of Array.isArray(result) ? result : Object.values(result)) markObjects(frame, v, depth + 1);
 }
 
 // Brings a frame on screen, outermost iframe first, so a person watching
