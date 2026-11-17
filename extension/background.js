@@ -383,8 +383,10 @@ const ops = {
       // The frames already there arrive as events just after.
       await new Promise((r) => setTimeout(r, 150));
       // Cut off while waiting: the list is empty because the session ended,
-      // not because the page has no frames.
-      if (!attached.has(tabId)) throw new Error(`Debugger is not attached to the tab with id: ${tabId}. (Chrome cut it off)`);
+      // not because the page has no frames. autoAttached, not attached: another
+      // command may have attached again since, in a session that never asked
+      // for frames (a detach clears autoAttached; only this puts it back).
+      if (!autoAttached.has(tabId)) throw new Error(`Debugger is not attached to the tab with id: ${tabId}. (Chrome cut it off)`);
     }
     return [...(frameSessions.get(tabId) || [])].map(([sessionId, f]) => ({ sessionId, ...f }));
   },

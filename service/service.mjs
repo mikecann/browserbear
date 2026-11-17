@@ -842,7 +842,7 @@ async function documents(tabId) {
   };
   await Promise.all(
     [null, ...oopifs.keys()].map(async (session) => {
-      const tree = await cdp(tabId, 'Page.getFrameTree', {}, PROBE_MS, session).then((r) => r.frameTree, () => null);
+      const tree = await cdp(tabId, 'Page.getFrameTree', {}, PROBE_MS, session).then((r) => r.frameTree, unlessCutOff);
       if (tree) walk(tree, session, session);
     }),
   );
@@ -1412,7 +1412,9 @@ const SPLIT_ROW = `function () {
 
 // The boxes from this field on, or null if it isn't one of a row.
 async function splitRow(tabId, node) {
-  const field = await pinField(tabId, node).catch(() => null);
+  // Cut off: no answer isn't "not a row", or a whole code would go into its
+  // first box once the debugger got back in (Codex's review, 17 Nov 2026).
+  const field = await pinField(tabId, node).catch(unlessCutOff);
   if (!field) return null;
   const { result } = await cdp(tabId, 'Runtime.callFunctionOn', { objectId: field, functionDeclaration: SPLIT_ROW });
   if (!result?.objectId) return null;
@@ -1505,17 +1507,18 @@ async function typeAsKeys(tabId, text) {
 // same as one that ignored it, so its text gets typed twice; the note says so.
 // Multi-line text is left alone: a composer can send on a line break and empty.
 async function typeChecked(tabId, node, text) {
-  const field = text && !text.includes('\n') ? await pinField(tabId, node).catch(() => null) : null;
+  // Cut off stops the typing rather than leave it unchecked (see splitRow).
+  const field = text && !text.includes('\n') ? await pinField(tabId, node).catch(unlessCutOff) : null;
   const standIn = await pinField(tabId, node)
     .then((f) => f && cdp(tabId, 'Runtime.callFunctionOn', { objectId: f, functionDeclaration: STAND_IN, returnByValue: true }))
-    .then((r) => r?.result?.value === true, () => false);
+    .then((r) => r?.result?.value === true, (e) => (unlessCutOff(e), false));
   if (standIn) {
     await typeAsKeys(tabId, text);
     await settle();
     // Nothing to check it against: the app moves its editor, or empties it as it reads.
     return "(the field is hidden, a canvas app's stand-in for the keyboard as in Google Sheets, so that was real key presses; snap or shot to see it landed)";
   }
-  const before = field && (await watchField(tabId, field, text).catch(() => null));
+  const before = field && (await watchField(tabId, field, text).catch(unlessCutOff));
   await cdp(tabId, 'Input.insertText', { text });
   await settle();
   if (!before) return ''; // a canvas editor, say: nothing to read back
@@ -2002,7 +2005,7 @@ const commands = {
       // too: its check that the field holds exactly the text can't pass on one box.
       const chars = text.includes('\n') ? [] : [...text.replace(/[\s-]/g, '')];
       // One character too: a full box won't take it any other way.
-      const boxes = chars.length ? await splitRow(tab, node).catch(() => null) : null;
+      const boxes = chars.length ? await splitRow(tab, node).catch(unlessCutOff) : null;
       sending();
       const { note, left } = boxes ? await typeSplit(tab, boxes, chars) : { note: replace ? await replaceText(tab, node, text) : await typeChecked(tab, node, text) };
       if (submit && !left) {
