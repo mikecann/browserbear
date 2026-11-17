@@ -22,7 +22,7 @@ const attached = new Map(); // tabId -> idle-detach timer
 // session once asked (Target.setAutoAttach), and commands for it go with its
 // sessionId. tabId -> Map(sessionId -> { targetId, url, parent sessionId })
 const frameSessions = new Map();
-const autoAttached = new Set(); // tabIds whose session has asked for them
+const autoAttached = new Map(); // tabId -> the promise of its session asking for them
 const AUTO_ATTACH = { autoAttach: true, waitForDebuggerOnStart: false, flatten: true, filter: [{ type: 'iframe' }] };
 // How far the chain to the Mac gets, for the setup page. An error is kept
 // through the 2 s retries until the host really answers, so the page doesn't
@@ -370,24 +370,33 @@ const ops = {
   // The tab's cross-origin iframes, each with the sessionId cdp takes for it.
   async frames({ tabId }) {
     await attach(tabId);
-    if (!autoAttached.has(tabId)) {
-      autoAttached.add(tabId);
-      try {
+    // One ask per debugger session, which every frames request in that session
+    // waits on, so a second request doesn't answer before the frames arrive.
+    // forgetFrames drops it whenever the session changes (attach, detach,
+    // Chrome cutting us off), so the promise also says which session it was.
+    let asking = autoAttached.get(tabId);
+    if (!asking) {
+      asking = (async () => {
         await chrome.debugger.sendCommand({ tabId }, 'Target.setAutoAttach', AUTO_ATTACH);
-      } catch (e) {
-        autoAttached.delete(tabId);
-        // Cut off (see attach()): only a look, so it's safe to try again.
-        if (/Detached while handling|not attached/.test(String(e?.message))) throw new Error(`Debugger is not attached to the tab with id: ${tabId}. (Chrome cut it off)`);
-        throw e;
-      }
-      // The frames already there arrive as events just after.
-      await new Promise((r) => setTimeout(r, 150));
-      // Cut off while waiting: the list is empty because the session ended,
-      // not because the page has no frames. autoAttached, not attached: another
-      // command may have attached again since, in a session that never asked
-      // for frames (a detach clears autoAttached; only this puts it back).
-      if (!autoAttached.has(tabId)) throw new Error(`Debugger is not attached to the tab with id: ${tabId}. (Chrome cut it off)`);
+        // The frames already there arrive as events just after.
+        await new Promise((r) => setTimeout(r, 150));
+      })();
+      autoAttached.set(tabId, asking);
+      asking.catch(() => autoAttached.get(tabId) === asking && autoAttached.delete(tabId));
     }
+    const cutOff = () => new Error(`Debugger is not attached to the tab with id: ${tabId}. (Chrome cut it off)`);
+    try {
+      await asking;
+    } catch (e) {
+      // Cut off (see attach()): only a look, so it's safe to try again.
+      if (/Detached while handling|not attached/.test(String(e?.message))) throw cutOff();
+      throw e;
+    }
+    // Cut off while waiting: the list is empty because the session ended, not
+    // because the page has no frames. Checked by session, not by being attached
+    // or asked at all: a newer session (another request's) may have attached
+    // and asked since, and its frames haven't arrived (Codex's review, 17 Nov 2026).
+    if (autoAttached.get(tabId) !== asking) throw cutOff();
     return [...(frameSessions.get(tabId) || [])].map(([sessionId, f]) => ({ sessionId, ...f }));
   },
 
