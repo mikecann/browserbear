@@ -36,6 +36,9 @@ const PAGE = `<!doctype html><title>Campaigns</title>
 <button id="split">Close<br>account</button>
 <button id="pinned">Pin</button><button id="pinned2">Pin</button>
 <div id="tip" style="position: absolute; padding: 20px; background: #eee">tip</div>
+<div class="c"><div class="tile" id="saved">Saved Templates</div><div class="tile" id="importCard"><span>Import/Upload HTML</span></div></div>
+<ul id="importMenu" style="display: none"><li><a id="importContent">Upload from Computer</a></li><li><a>Import from Cloud</a></li></ul>
+<ul id="otherMenu" style="display: none"><li><a>Upload from Computer</a></li></ul>
 <div style="height: 3000px"></div>
 <span class="act" id="far">Go Ahead</span>
 <script>
@@ -63,6 +66,9 @@ document.addEventListener('click', (e) => {
     return say('asked to delete ' + row, e);
   }
   if (e.target.id === 'behind') say('behind the dialog', e);
+  // Opens on a click, not a hover, and each click toggles it.
+  if (e.target.closest('#importCard')) { importMenu.style.display = importMenu.style.display === 'none' ? 'block' : 'none'; return say('import card', e); }
+  if (e.target.id === 'importContent') say('upload from computer', e);
   if (e.target.id === 'split') say('close account', e);
   if (e.target.id === 'far') say('far below the dialog', e);
   if (e.target.id === 'icon' || e.target.closest?.('#icon')) say('archive', e);
@@ -146,6 +152,26 @@ test('click finds controls with no role by text or selector, hovering first', { 
   // Nor is a narrow panel far taller than the window.
   await browserbear('eval', TAB, "tip.style.height = '20000px'; tip.style.width = '60px'; 1");
   assert.match(await fails('click', TAB, '--text', 'Pin'), /matches 2/);
+  await browserbear('eval', TAB, 'tip.remove(); 1');
+
+  // A menu that opens on a click: hovering doesn't show it, and the error
+  // says to click what opens it. --reveal does that, then the option.
+  assert.match(await fails('click', TAB, '--text', 'Upload from Computer', '--nth', '1'), /didn't show it\. If it opens on a click[^]*--reveal/);
+  const revealed = await browserbear('click', TAB, '--text', 'Upload from Computer', '--reveal', 'Import/Upload HTML');
+  assert.match(revealed, /\(clicked e\d+ first to show it/);
+  assert.deepEqual((await log()).slice(-2), ['import card', 'upload from computer']);
+  // Showing already: not clicked again, which would shut it.
+  await browserbear('click', TAB, '--css', '#importCard');
+  await browserbear('click', TAB, '--text', 'Upload from Computer', '--reveal', 'Import/Upload HTML');
+  assert.deepEqual((await log()).slice(-2), ['import card', 'upload from computer']);
+  assert.match(await fails('click', TAB, '--text', 'Upload from Computer', '--reveal'), /--reveal needs the text/);
+  // Nothing is clicked to reveal when the target is a ref, ambiguous among
+  // what's showing, or a bad selector.
+  const clicks = (await log()).length;
+  assert.match(await fails('click', TAB, 'e1', '--reveal', 'Import/Upload HTML'), /--reveal goes with --text or --css/);
+  assert.match(await fails('click', TAB, '--text', 'Edit', '--reveal', 'Import/Upload HTML'), /matches 2/);
+  assert.match(await fails('click', TAB, '--css', 'a[', '--reveal', 'Import/Upload HTML'), /not a CSS selector/);
+  assert.equal((await log()).length, clicks);
 
   // A real click far down a scrolled page: the check for what's on top used
   // to look a scroll's height above it, and fell back to a script click.
@@ -158,4 +184,10 @@ test('click finds controls with no role by text or selector, hovering first', { 
 
   assert.match(await fails('click', TAB, '--text', 'No such thing'), /nothing in the page matches the text "No such thing"/);
   assert.match(await fails('click', TAB, '--css', 'a[title='), /is not a CSS selector that works/);
+
+  // An opener that goes to another page stops there, rather than clicking
+  // whatever matches on the new one. Last, as it leaves this page.
+  await browserbear('eval', TAB, "const a = document.createElement('a'); a.href = '/other'; a.textContent = 'Go elsewhere'; document.body.prepend(a); 1");
+  assert.match(await fails('click', TAB, '--text', 'Only on this page', '--reveal', 'Go elsewhere'), /went to another page, so nothing more was clicked/);
+  assert.deepEqual(await log(), []);
 });

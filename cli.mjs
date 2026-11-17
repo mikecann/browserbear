@@ -26,7 +26,9 @@ const USAGE = `browserbear: let agents use your real Chrome profiles
                                                 text (exactly, else containing it) or matching that selector, after
                                                 hovering it. One hidden until hovered (a card's "Create New") is
                                                 shown by hovering what's around it. Several matches is an error
-                                                listing them, unless --nth picks one. Prints the ref it got
+                                                listing them, unless --nth picks one. Prints the ref it got.
+                                                --reveal <text>: click what has that text first, for options a
+                                                card or menu only shows once it's clicked (skipped if they show)
   browserbear hover <tab> <ref> | --text <text> | --css <selector> [--nth n]
                                                 put the pointer over it, for menus and buttons that show on hover
   browserbear type <tab> <ref|-> <text> [--submit] [--replace]
@@ -91,7 +93,7 @@ function parse(argv) {
       const next = argv[i + 1];
       // --group is gone (Chrome kept every group on the bookmarks bar), but
       // still eats its value so old commands don't read it as a URL.
-      if (next !== undefined && !next.startsWith('--') && ['profile', 'group', 'until-url', 'until-text', 'timeout', 'item', 'to', 'css', 'text', 'nth'].includes(key)) flags[key] = argv[++i];
+      if (next !== undefined && !next.startsWith('--') && ['profile', 'group', 'until-url', 'until-text', 'timeout', 'item', 'to', 'css', 'text', 'nth', 'reveal'].includes(key)) flags[key] = argv[++i];
       else flags[key] = true;
     } else pos.push(a);
   }
@@ -116,7 +118,7 @@ function argsFor(cmd, pos, flags) {
       return { tab: a, full: !!flags.full };
     case 'click':
     case 'hover':
-      return { tab: a, ref: b, css: flags.css, text: flags.text, nth: flags.nth === undefined ? undefined : flags.nth === true ? NaN : Number(flags.nth), script: cmd === 'click' && !!flags.script };
+      return { tab: a, ref: b, css: flags.css, text: flags.text, nth: flags.nth === undefined ? undefined : flags.nth === true ? NaN : Number(flags.nth), script: cmd === 'click' && !!flags.script, reveal: cmd === 'click' ? flags.reveal : undefined };
     case 'type':
       return { tab: a, ref: b === '-' ? undefined : b, text: rest.join(' '), submit: !!flags.submit, replace: !!flags.replace };
     case 'key':

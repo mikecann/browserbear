@@ -1232,7 +1232,7 @@ async function hoverNode(tabId, backendNodeId, sending = () => {}) {
 // <a title=Edit> icons, and some of those clicks silently did nothing.
 // Returns [element, the nearest drawn ancestor of a hidden one, JSON info].
 // Open shadow roots are searched too; cross-origin frames aren't.
-const FIND = `function (css, text, nth) {
+const FIND = `function (css, text, nth, peek) {
   const tidy = (s) => String(s ?? '').replace(/\\s+/g, ' ').trim();
   const norm = (s) => tidy(s).toLowerCase();
   const all = (root, sel) => {
@@ -1304,6 +1304,9 @@ const FIND = `function (css, text, nth) {
     // Nothing says exactly that: then anything with it in, innermost first.
     if (!found.els.length) found = pick(els.filter((el) => names(el).some((n) => n.includes(want))));
   }
+  // For --reveal: whether a drawn match is there already. Errors above (a bad
+  // selector) still come back as errors, so nothing gets clicked over them.
+  if (peek) return [null, null, JSON.stringify({ shown: found.els.length > 0 && !found.hidden })];
   if (!found.els.length) return [null, null, JSON.stringify({ error: 'nothing in the page matches ' + what }) ];
   let pool = found.els;
   const hidden = found.hidden;
@@ -1369,7 +1372,8 @@ const isRef = (target) => /^e\d+$/.test(target);
 // --css or --text, which then gets a ref of its own for next time. A hidden
 // match (a button that only shows while its card is hovered) is revealed by
 // hovering the nearest ancestor that's drawn.
-async function resolveTarget(tabId, { ref, css, text, nth }, sending) {
+// peek: only whether a drawn match is there already, with no hovering.
+async function resolveTarget(tabId, { ref, css, text, nth, peek = false }, sending) {
   if (css === true || text === true) throw new Error(`--${css === true ? 'css' : 'text'} needs a value`);
   if (nth !== undefined && !(Number.isInteger(nth) && nth > 0)) throw new Error('--nth takes a number from 1');
   if (ref && isRef(ref) && !css && !text) return { node: await nodeFor(tabId, ref), ref, note: '' };
@@ -1378,11 +1382,13 @@ async function resolveTarget(tabId, { ref, css, text, nth }, sending) {
   if (!css && !text) throw new Error('say what to act on: a ref from browserbear snap (e12), --css <selector> or --text <text>');
   const group = 'browserbear-find';
   try {
-    const r = await cdp(tabId, 'Runtime.evaluate', { expression: `(${FIND})(${JSON.stringify(css || null)}, ${JSON.stringify(text || null)}, ${nth || 0})`, objectGroup: group });
+    const r = await cdp(tabId, 'Runtime.evaluate', { expression: `(${FIND})(${JSON.stringify(css || null)}, ${JSON.stringify(text || null)}, ${nth || 0}, ${peek})`, objectGroup: group });
     if (r.exceptionDetails) throw new Error(r.exceptionDetails.exception?.description || r.exceptionDetails.text);
     const { result: props } = await cdp(tabId, 'Runtime.getProperties', { objectId: r.result.objectId, ownProperties: true });
     const slot = (k) => props.find((p) => p.name === k)?.value;
     const info = JSON.parse(slot('2').value);
+    if (info.error) throw new Error(`in tab ${tabId}, ${info.error}`);
+    if (peek) return { shown: info.shown };
     if (info.error) throw new Error(`in tab ${tabId}, ${info.error}`);
     const backendOf = async (o) => (o?.objectId ? (await cdp(tabId, 'DOM.describeNode', { objectId: o.objectId })).node.backendNodeId : null);
     const node = await backendOf(slot('0'));
@@ -1398,7 +1404,7 @@ async function resolveTarget(tabId, { ref, css, text, nth }, sending) {
       functionDeclaration: `function () { const r = this.getBoundingClientRect(); return r.width > 0 && r.height > 0 && this.checkVisibility({ opacityProperty: true, visibilityProperty: true }); }`,
       returnByValue: true,
     });
-    if (!result.value) throw new Error(`in tab ${tabId}, ${info.desc} is hidden, and hovering over ${info.revealer} didn't show it${how ? ` ${how}` : ''}`);
+    if (!result.value) throw new Error(`in tab ${tabId}, ${info.desc} is hidden, and hovering over ${info.revealer} didn't show it${how ? ` ${how}` : ''}. If it opens on a click (a card or menu that shows its options when clicked), add --reveal "<the text of what opens it>" to click that first, or click it yourself and then this again`);
     return { node, ref: named, note: `(${named} is ${info.desc}; it showed once the pointer was over ${info.revealer})` };
   } finally {
     cdp(tabId, 'Runtime.releaseObjectGroup', { objectGroup: group }).catch(() => {});
@@ -2264,17 +2270,42 @@ const commands = {
 
   snap: ({ tab, full }) => snapshot(tab, { full }),
 
-  click: ({ tab, ref: given, css, text, nth, script }) =>
+  click: ({ tab, ref: given, css, text, nth, script, reveal }) =>
     orClosed(tab, async (sending) => {
       const before = state(tab).last;
       const startUrl = (await tabNow(tab))?.url;
+      // --reveal: click what opens it first, for a menu that shows its options
+      // on a click rather than a hover (Zoho's "Import/Upload HTML" card, whose
+      // "Upload from Computer" sits hidden elsewhere in the page, 17 Nov).
+      // Not when it's showing already: the click could shut it again.
+      let opened = '';
+      if (reveal !== undefined) {
+        if (typeof reveal !== 'string' || !reveal) throw new Error('--reveal needs the text of what opens it');
+        // A ref is something snap saw, so it's showing; and a peek can't tell.
+        if (given && isRef(given) && !css && !text) throw new Error('--reveal goes with --text or --css: a ref is from something snap saw, so it is showing already');
+        // Only when there's no drawn match at all. Two showing, or a bad
+        // selector, is an error before anything's clicked (Codex's review).
+        if (!(await resolveTarget(tab, { ref: given, css, text, nth, peek: true })).shown) {
+          const opener = await resolveTarget(tab, { text: reveal }, sending);
+          const was = (await tabNow(tab))?.url;
+          await markPage(tab);
+          const how = await clickNode(tab, opener.node, { script, hover: true, sending });
+          await settleAfterAction(tab);
+          // Gone to another page: what matches there isn't what was meant.
+          const mark = await evaluate(tab, 'window.__browserbear ?? null').catch(() => null);
+          if (mark !== 'here' || (await tabNow(tab))?.url !== was) {
+            throw new Error(`clicking ${opener.ref} to show it went to another page, so nothing more was clicked. ${opener.note}\n${await snapshot(tab)}`);
+          }
+          opened = [`(clicked ${opener.ref} first to show it: ${opener.note.replace(/^\(\S+ is |\)$/g, '')})`, how].filter(Boolean).join('\n');
+        }
+      }
       const found = await resolveTarget(tab, { ref: given, css, text, nth }, sending);
       const { node, ref } = found;
       // Found by --css or --text, or listed as a plain clickable: a <div> may
       // only take clicks once it's hovered, as the user's mouse would have.
       const hover = !!(css || text || !isRef(given)) || listedClickable(tab, ref);
       await markPage(tab);
-      const note = [found.note, await clickNode(tab, node, { script, hover, sending })].filter(Boolean).join('\n');
+      const note = [opened, found.note, await clickNode(tab, node, { script, hover, sending })].filter(Boolean).join('\n');
       await settleAfterAction(tab);
       let out = await snapshot(tab);
       // A new address counts by itself: history.pushState can leave every control as it was.

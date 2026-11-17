@@ -48,7 +48,9 @@ browserbear CLI (or Threadbear)
   That's a real click at the element's centre after moving the pointer onto it, and
   only something on top can be picked, so a dialog's "Delete" wins over the row's behind
   it. A match that's hidden until hovered (a card's "Create New") is shown by hovering
-  the nearest thing around it that's drawn.
+  the nearest thing around it that's drawn. Options that only show once something is
+  clicked (Zoho's "Import/Upload HTML" card) take `--reveal "<its text>"`, which clicks
+  that first, unless they're showing already, since a second click could shut them.
 - Everything that changes a page answers with that diff, so there's no separate look.
 - The extension detaches from a tab 30 s after its last command, so Chrome's "started
   debugging this browser" bar doesn't hang around.
