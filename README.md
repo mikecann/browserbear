@@ -179,6 +179,7 @@ browserbear click 1234 --text "Regular email"  # or --css "a[title=Edit]" --nth 
 browserbear type 1234 e7 "Hello" --submit
 browserbear upload 1234 e12 ~/talk.mp3         # e12 can be the "Choose files" button
 browserbear download 1234 <url> --to ./files/  # with the tab's sign-in; prints the path
+browserbear secret 1234 e9 --to ~/.config/gemini/api-key  # a key shown in the page, never printed
 browserbear read 1234                          # page text; long pages go to a file
 browserbear shot 1234                          # prints the PNG path
 browserbear handoff 1234                       # your turn: the tab comes forward in your Chrome
@@ -282,10 +283,21 @@ npm test
 The end-to-end test plays the extension over native messaging to the real host, which
 starts the real service, which the real CLI talks to. No Chrome needed.
 
+## Keys shown in a page
+
+`browserbear secret <tab> <ref> --to <file>` takes an API key or token a page
+shows (a field's value or an element's text, iframes included, like AI Studio's
+in the Cloud console's frame) and writes it to a file only you can read, in a
+folder only you can open if it makes one. It prints the key's length and last 4
+characters, never the key, so it stays out of the agent's transcript; `--replace`
+writes a new key over the old file. Keys in common formats (Google's `AIza…`,
+`sk-…`, GitHub's `ghp_…`, Slack's `xox…`, Stripe's and AWS's) are blanked in
+everything else BrowserBear prints: snap, read, click diffs, eval and errors.
+Screenshots still show them.
+
 ## Not yet
 
 - No approvals yet for posting, sending or buying; Threadbear will own those.
-- No `secret_to` (move a key from a page into Convex env or Keychain without it
-  passing through the agent).
+- `secret` writes only to a file: not yet into Keychain or a Convex deployment's env.
 - Installing into every profile at once (unlisted Web Store listing plus an External
   Extensions file) and a LaunchAgent for the service.

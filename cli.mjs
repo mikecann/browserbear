@@ -6,6 +6,7 @@ import fs from 'node:fs';
 import net from 'node:net';
 import path from 'node:path';
 import { spawn } from 'node:child_process';
+import { randomBytes } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import { HOME, SOCKET, line, lineReader } from './service/wire.mjs';
 import { createHandoffWatch } from './service/handoff-wait.mjs';
@@ -55,6 +56,14 @@ const USAGE = `browserbear: let agents use your real Chrome profiles
                                                 never ~/Downloads, which macOS keeps agents out of. --to moves it
                                                 somewhere of yours. Prints the path, size and type: a sign-in
                                                 page saved as text/html means the link needed more than the cookies
+  browserbear secret <tab> <ref> | --css <selector> | --text <text> --to <file> [--replace]
+                                                writes a key or token shown in the page (a field's value or an
+                                                element's text, in iframes too) to a file only you can read
+                                                (made in a 700 folder if it's new), and prints only its length
+                                                and last 4 characters, so it never goes through your output.
+                                                --replace writes over a key file that's there. Keys in common
+                                                formats (AIza…, sk-…, ghp_…) are blanked in everything else
+                                                BrowserBear prints
   browserbear dialog <tab> accept|dismiss [text]
   browserbear show <tab>                        bring a tab forward in its window (real clicks need it)
                                                 A tab behind another is hidden, and Chrome slows its timers, so
@@ -155,6 +164,8 @@ function argsFor(cmd, pos, flags) {
       return { tab: a, ref: b, files: rest };
     case 'download':
       return { tab: a, url: b, filename: rest[0] };
+    case 'secret':
+      return { tab: a, ref: b, css: flags.css, text: flags.text, nth: flags.nth === undefined ? undefined : flags.nth === true ? NaN : Number(flags.nth) };
     case 'dialog':
       return { tab: a, action: b, text: rest.join(' ') || undefined };
     default:
@@ -270,6 +281,44 @@ function moveTo(from, to) {
   return dest;
 }
 
+// secret --to: the key goes from the service straight into the file, here, so
+// it's never printed. A file only its owner can read, in a folder only they
+// can open if it's made here, written whole and renamed in. Something already
+// there is replaced only with --replace (a rotated key), and only if it's a
+// file: --to ~/.zshrc by mistake shouldn't eat it.
+function writeSecret(value, to, replace) {
+  const dest = path.resolve(to.replace(/^~(?=\/|$)/, process.env.HOME));
+  const there = fs.lstatSync(dest, { throwIfNoEntry: false });
+  if (there && !replace) throw new Error(`--to: ${dest} is already there; add --replace to write the new key over it`);
+  if (there && !there.isFile()) throw new Error(`--to: ${dest} isn't a plain file, so the key wasn't written there`);
+  fs.mkdirSync(path.dirname(dest), { recursive: true, mode: 0o700 });
+  // A name nothing else has, made here or not at all, so cleaning up never
+  // removes someone else's file (Codex's review).
+  const tmp = `${dest}.${randomBytes(6).toString('hex')}.tmp`;
+  const fd = fs.openSync(tmp, 'wx', 0o600);
+  try {
+    // Inside the try, so a write that fails part way (a full disk) doesn't
+    // leave part of the key behind (Codex's review).
+    try {
+      fs.writeFileSync(fd, value + '\n');
+    } finally {
+      fs.closeSync(fd);
+    }
+    // Without --replace, a link fails if the name was taken since the check
+    // above, rather than a rename quietly replacing it.
+    if (replace) fs.renameSync(tmp, dest);
+    else fs.linkSync(tmp, dest);
+  } catch (e) {
+    if (e.code === 'EEXIST') e.message = `--to: ${dest} is already there; add --replace to write the new key over it`;
+    throw e;
+  } finally {
+    fs.rmSync(tmp, { force: true });
+  }
+  // A short one would be mostly given away by its end.
+  const end = value.length >= 16 ? `, ending ${value.slice(-4)}` : '';
+  return `wrote the key (${value.length} characters${end}) to ${dest}, readable only by you`;
+}
+
 // exitCode rather than process.exit(): exiting inside the top-level await
 // makes Node print "Detected unsettled top-level await" under every error.
 const { cmd, pos, flags } = parse(process.argv.slice(2));
@@ -309,10 +358,17 @@ if (cmd === 'agent-only') {
     } else {
       // Which Threadbear thread is asking, so the tabs it uses carry its name
       // (service/marks.mjs). Unset outside Threadbear: the tab says "agent".
+      if (cmd === 'secret' && (typeof flags.to !== 'string' || !flags.to)) throw new Error('secret needs --to <file> to write the key to, e.g. --to ~/.config/gemini/api-key');
       const result = await request({ id: 1, cmd, args, thread });
-      if (cmd === 'download' && flags.to) result.path = moveTo(result.path, flags.to);
-      if (cmd === 'open' && flags.id) console.log(openedId(result));
-      else console.log(typeof result === 'string' ? result : JSON.stringify(result, null, 2));
+      if (cmd === 'secret') {
+        if (typeof result?.secret !== 'string') throw new Error('the BrowserBear service is older than this command; try again in a few seconds, once it has restarted');
+        // Never the result itself: that's the key.
+        console.log(writeSecret(result.secret, flags.to, !!flags.replace));
+      } else {
+        if (cmd === 'download' && flags.to) result.path = moveTo(result.path, flags.to);
+        if (cmd === 'open' && flags.id) console.log(openedId(result));
+        else console.log(typeof result === 'string' ? result : JSON.stringify(result, null, 2));
+      }
     }
   } catch (e) {
     if (cmd === 'open' && flags.id && openedId(e.message)) console.log(openedId(e.message));

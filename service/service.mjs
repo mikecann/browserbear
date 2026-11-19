@@ -326,7 +326,7 @@ const ACTS = new Set(['click', 'hover', 'type', 'key', 'goto', 'upload', 'dialog
 const NOT_YOURS = "If you meant a tab you opened, use the id browserbear open printed (open --id prints only that), not a match from browserbear tabs.";
 
 function refuseUserTab(cmd, tabId, { who, left, t }) {
-  const page = `"${t.title.slice(0, 60)}" <${t.url.slice(0, 100)}>`;
+  const page = `"${redact(t.title).slice(0, 60)}" <${redact(t.url).slice(0, 100)}>`;
   if (left) {
     return new Error(
       `tab ${tabId} (${page}) was opened by an agent, but it has left BrowserBear's window without a handoff (the user may have dragged it into one of their own windows), so it counts as theirs now and BrowserBear won't ${cmd} ${cmd === 'close' ? 'it' : 'in it'}. snap, read, shot and eval can still look at it. ` +
@@ -374,12 +374,13 @@ const panel = createPanel({ home: HOME, profiles: () => [...profiles.values()], 
 // What the pill in an agent's tab says it's doing, per command.
 const USES = {
   snap: () => 'looking at the page',
-  click: ({ tab, ref, text }) => `clicking ${text && text !== true ? `"${String(text).slice(0, 40)}"` : labelOf(tab, ref)}`,
+  click: ({ tab, ref, text }) => `clicking ${text && text !== true ? `"${redact(String(text)).slice(0, 40)}"` : labelOf(tab, ref)}`,
   hover: () => 'pointing at something',
   type: () => 'typing',
   key: ({ key }) => `pressing ${key}`,
   goto: ({ url }) => `going to ${hostOf(url)}`,
   read: () => 'reading the page',
+  secret: () => 'saving a key to a file',
   shot: () => 'taking a screenshot',
   eval: () => 'running a script',
   cdp: () => 'working',
@@ -908,7 +909,41 @@ async function unlessAgents(tabId, owner, { always = false } = {}) {
 // it themselves as well, at the point they look. goto is handled apart, in
 // onClientMessage. show brings it forward anyway; dialog and fill work on a
 // page that's waiting on them.
-const WAKES = new Set(['eval', 'click', 'hover', 'type', 'key', 'upload', 'snap', 'read', 'shot']);
+// Keys in well-known formats, blanked in everything BrowserBear prints, so
+// one a page shows (AI Studio after "Show key") doesn't land in the agent's
+// transcript through a snap, click diff, read or eval. browserbear secret
+// saves one to a file instead. Screenshots still show them.
+const KEY_FORMATS = [
+  /AIza[0-9A-Za-z_-]{35}/g, // Google
+  /(?<![A-Za-z0-9])sk-(?:ant-|proj-)?[A-Za-z0-9_-]{20,}/g, // Anthropic, OpenAI and others
+  /(?<![A-Za-z0-9])(?:sk|rk)_(?:live|test)_[A-Za-z0-9]{16,}/g, // Stripe
+  /(?<![A-Za-z0-9])gh[pousr]_[A-Za-z0-9]{36,}|github_pat_[A-Za-z0-9_]{22,}/g, // GitHub
+  /(?<![A-Za-z0-9])xox[abposr]-[A-Za-z0-9-]{10,}/g, // Slack
+  /(?<![A-Z0-9])AKIA[0-9A-Z]{16}(?![A-Z0-9])/g, // AWS
+];
+// The start of one, cut short where a long name is clipped with "…".
+const KEY_CLIPPED = /(?:AIza|(?<![A-Za-z0-9])(?:sk-|(?:sk|rk)_(?:live|test)_|gh[pousr]_|github_pat_|xox[abposr]-)|(?<![A-Z0-9])AKIA)[A-Za-z0-9_-]{4,}(?=…)/g;
+const redactText = (text) =>
+  // Clipped ones first: a long key cut short can still look whole, and its
+  // "end" would be from the middle (Codex's review).
+  KEY_FORMATS.reduce((t, re) => t.replace(re, (k) => `[a key ending ${k.slice(-4)}; browserbear secret saves it to a file]`), text.replace(KEY_CLIPPED, '[part of a key]'));
+// Strings anywhere in a reply: eval of an object, a raw cdp result (Codex's review).
+const redact = (v, depth = 0) => {
+  if (typeof v === 'string') return redactText(v);
+  if (!v || typeof v !== 'object') return v;
+  if (depth > 50) return '[too deep to show]';
+  if (Array.isArray(v)) return v.map((x) => redact(x, depth + 1));
+  return Object.fromEntries(Object.entries(v).map(([k, x]) => [redactText(k), redact(x, depth + 1)]));
+};
+
+// A field's value, or an element's text.
+const READ_SECRET = `function () {
+  const el = this.nodeType === 1 ? this : this.parentElement;
+  if (el.matches('input, textarea, select')) return el.value;
+  return el.innerText ?? el.textContent;
+}`;
+
+const WAKES = new Set(['secret', 'eval', 'click', 'hover', 'type', 'key', 'upload', 'snap', 'read', 'shot']);
 const LOOKS_FIRST = new Set(['snap', 'read', 'shot']);
 const hiddenNote = (tabId) =>
   `note: tab ${tabId} is hidden (behind another tab or window), so Chrome slows its timers and pages that draw on them (YouTube Studio's analytics) can take a minute to fill in. It's one of the user's own tabs, so BrowserBear doesn't make it think it's in front; browserbear show ${tabId} brings it forward in its window.`;
@@ -2468,6 +2503,85 @@ const remember = (instance, tab) => {
   return tab;
 };
 
+// Sign in from 1Password (onepassword.mjs): whatever of username, password
+// and one-time code the page is asking for now, so a two-step sign-in
+// (Google's email page, then its password page) takes a fill on each. The
+// values go from 1Password into the page and nowhere else: what comes back
+// is which login and which fields, nothing the page wrote. Until the tab
+// loads another page, eval, cdp and secret are refused there and snapshots hide the
+// filled fields, so the values can't be read back either.
+async function fillIn({ tab, item, submit }) {
+  if ((await ownerOf(tab)).instance !== AGENT_INSTANCE) throw new Error(`fill only signs in in the agent's own Chrome (--profile agent), not tab ${tab}`);
+  await cdp(tab, 'Page.enable');
+  const { frameTree } = await cdp(tab, 'Page.getFrameTree');
+  const startUrl = frameTree.frame.url;
+  const { executionContextId } = await cdp(tab, 'Page.createIsolatedWorld', { frameId: frameTree.frame.id, worldName: 'browserbear-fill' });
+  const { result: doc } = await cdp(tab, 'Runtime.evaluate', { expression: 'document', contextId: executionContextId });
+  const { result: found } = await cdp(tab, 'Runtime.callFunctionOn', { objectId: doc.objectId, functionDeclaration: FIND_LOGIN_FIELDS, returnByValue: false });
+  const props = Object.fromEntries((await cdp(tab, 'Runtime.getProperties', { objectId: found.objectId, ownProperties: true })).result.map((x) => [x.name, x.value]));
+  const field = (name) => (props[name]?.subtype === 'node' ? props[name].objectId : null);
+  const fields = { user: field('user'), password: field('password'), otp: field('otp') };
+  if (!fields.user && !fields.password && !fields.otp) {
+    throw new Error(`tab ${tab} has no sign-in field fill can see (it doesn't reach into frames). Snap it, or hand it to the user: browserbear handoff ${tab} --wait`);
+  }
+  if (fields.otp && props.splitCode?.value) {
+    throw new Error(`tab ${tab} wants a one-time code split across several boxes, which fill doesn't type. Hand it to the user: browserbear handoff ${tab} --wait`);
+  }
+  const logins = await loginsFor(startUrl);
+  const login = pickLogin(logins, item, startUrl);
+  const secret = await secretsFor(login.id, { otp: Boolean(fields.otp) });
+  if (fields.otp && !secret.hasOtp) {
+    throw new Error(`the page wants a one-time code, but "${login.title}" in 1Password has none. Hand it to the user: browserbear handoff ${tab} --wait`);
+  }
+  const filled = [];
+  const backendIds = [];
+  // On disk before anything's typed: a service restarted after typing, with
+  // nothing saved, would let eval or secret read it back (Codex's review).
+  const hadRecord = filledTabs.has(tab);
+  if (!protectFilled(tab, frameTree.frame.loaderId, [])) {
+    throw new Error(`fill can't keep track of what it types (${FILLED} couldn't be saved), so it didn't type anything. Hand the sign-in to the user: browserbear handoff ${tab} --wait`);
+  }
+  try {
+    for (const [which, value, label] of [['user', secret.username, 'username'], ['password', secret.password, 'password'], ['otp', secret.otp, 'one-time code']]) {
+      if (!fields[which] || !value) continue;
+      // Approving in 1Password takes a while; the tab may have gone
+      // somewhere else meanwhile, and a login only goes to its own site.
+      backendIds.push((await cdp(tab, 'DOM.describeNode', { objectId: fields[which] })).node.backendNodeId);
+      // Saved before it's typed, so snap masks it even in a service restarted mid-fill.
+      if (!protectFilled(tab, frameTree.frame.loaderId, backendIds)) throw new FillStopped(`${FILLED} couldn't be saved, so it stopped before typing the ${label}`);
+      const put = (await cdp(tab, 'Runtime.callFunctionOn', { objectId: fields[which], functionDeclaration: PUT_FIELD, arguments: [{ value }, { value: allowedFor(login) }], returnByValue: true })).result?.value;
+      if (put === 'site') throw new FillStopped(`the tab is no longer on a site "${login.title}" is saved for`);
+      // X keeps a hidden password box on its username step that goes once
+      // the username's in: what's typed so far is the step, not a failure.
+      if (put !== 'ok' && filled.length) break;
+      if (put !== 'ok') throw new FillStopped(`the page changed before fill could type the ${label}`);
+      filled.push(label);
+    }
+  } catch (e) {
+    // Whatever the page did meanwhile (a dialog, say) can carry what was
+    // typed, so only fill's own words go back.
+    throw e instanceof FillStopped ? new Error(`fill stopped: ${e.message}${filled.length ? ` (after the ${filled.join(', ')})` : ''}. Snap tab ${tab} to see where it is`) : new Error(`fill stopped in tab ${tab}${filled.length ? ` after the ${filled.join(', ')}` : ''}: the page changed or showed a dialog. Snap it to see where it is`);
+  } finally {
+    // The page as it is after typing: one that loaded in the meantime is
+    // the one holding the values.
+    if (backendIds.length) {
+      const loaderId = await cdp(tab, 'Page.getFrameTree').then((r) => r.frameTree.frame.loaderId, () => frameTree.frame.loaderId);
+      protectFilled(tab, loaderId, backendIds);
+    } else if (!hadRecord) {
+      // Nothing typed: the page needn't stay locked.
+      filledTabs.delete(tab);
+      saveFilled();
+    }
+  }
+  if (!filled.length) throw new Error(`"${login.title}" in 1Password has nothing for the fields on this page`);
+  if (submit) {
+    await markPage(tab);
+    await pressKey(tab, 'Enter').catch(() => {});
+    await settleAfterAction(tab).catch(() => {});
+  }
+  return `filled the ${filled.join(', ')} from 1Password ("${login.title}") in tab ${tab}${submit ? ' and pressed Enter' : "; press the page's sign-in button (or run fill again with --submit)"}. Snap it to see the next step.`;
+}
+
 const commands = {
   async status() {
     return { pid: process.pid, socket: SOCKET, profiles: [...profiles.values()].map(describe) };
@@ -2510,7 +2624,7 @@ const commands = {
         remember(p.instance, t);
         // So an agent can tell its own tab from the user's on the same page.
         const user = handed.has(t.tabId) || (t.agent && t.bear === false) ? ' (handed to the user)' : t.agent === false && !claimed.has(t.tabId) ? " (the user's)" : '';
-        out.push(`  ${t.tabId}${t.active ? '*' : ' '} ${t.title.slice(0, 60)} <${t.url.slice(0, 100)}>${user}${marks.label(t.tabId)}`);
+        out.push(`  ${t.tabId}${t.active ? '*' : ' '} ${redact(t.title).slice(0, 60)} <${redact(t.url).slice(0, 100)}>${user}${marks.label(t.tabId)}`);
       }
     }
     // Handoffs of tabs that have since closed, so a later tab given the same id
@@ -2558,7 +2672,7 @@ const commands = {
     }
     if (!hits.length) throw new Error(`no open tab matches "${match}"`);
     if (hits.length > 1) {
-      return `several tabs match; pick one by id:\n${hits.map(({ p, t }) => `  ${t.tabId} [${describe(p)}] ${t.title.slice(0, 60)} <${t.url.slice(0, 100)}>`).join('\n')}`;
+      return `several tabs match; pick one by id:\n${hits.map(({ p, t }) => `  ${t.tabId} [${describe(p)}] ${redact(t.title).slice(0, 60)} <${redact(t.url).slice(0, 100)}>`).join('\n')}`;
     }
     claimed.add(hits[0].t.tabId);
     // Before the snapshot, which stops short at a JS dialog: a tab an agent
@@ -2667,73 +2781,6 @@ const commands = {
       return (note ? note + '\n' : '') + (await snapshot(tab));
     }),
 
-  // Sign in from 1Password (onepassword.mjs): whatever of username, password
-  // and one-time code the page is asking for now, so a two-step sign-in
-  // (Google's email page, then its password page) takes a fill on each. The
-  // values go from 1Password into the page and nowhere else: what comes back
-  // is which login and which fields, nothing the page wrote. Until the tab
-  // loads another page, eval and cdp are refused there and snapshots hide the
-  // filled fields, so the values can't be read back either.
-  async fill({ tab, item, submit }) {
-    if ((await ownerOf(tab)).instance !== AGENT_INSTANCE) throw new Error(`fill only signs in in the agent's own Chrome (--profile agent), not tab ${tab}`);
-    await cdp(tab, 'Page.enable');
-    const { frameTree } = await cdp(tab, 'Page.getFrameTree');
-    const startUrl = frameTree.frame.url;
-    const { executionContextId } = await cdp(tab, 'Page.createIsolatedWorld', { frameId: frameTree.frame.id, worldName: 'browserbear-fill' });
-    const { result: doc } = await cdp(tab, 'Runtime.evaluate', { expression: 'document', contextId: executionContextId });
-    const { result: found } = await cdp(tab, 'Runtime.callFunctionOn', { objectId: doc.objectId, functionDeclaration: FIND_LOGIN_FIELDS, returnByValue: false });
-    const props = Object.fromEntries((await cdp(tab, 'Runtime.getProperties', { objectId: found.objectId, ownProperties: true })).result.map((x) => [x.name, x.value]));
-    const field = (name) => (props[name]?.subtype === 'node' ? props[name].objectId : null);
-    const fields = { user: field('user'), password: field('password'), otp: field('otp') };
-    if (!fields.user && !fields.password && !fields.otp) {
-      throw new Error(`tab ${tab} has no sign-in field fill can see (it doesn't reach into frames). Snap it, or hand it to the user: browserbear handoff ${tab} --wait`);
-    }
-    if (fields.otp && props.splitCode?.value) {
-      throw new Error(`tab ${tab} wants a one-time code split across several boxes, which fill doesn't type. Hand it to the user: browserbear handoff ${tab} --wait`);
-    }
-    const logins = await loginsFor(startUrl);
-    const login = pickLogin(logins, item, startUrl);
-    const secret = await secretsFor(login.id, { otp: Boolean(fields.otp) });
-    if (fields.otp && !secret.hasOtp) {
-      throw new Error(`the page wants a one-time code, but "${login.title}" in 1Password has none. Hand it to the user: browserbear handoff ${tab} --wait`);
-    }
-    const filled = [];
-    const backendIds = [];
-    try {
-      for (const [which, value, label] of [['user', secret.username, 'username'], ['password', secret.password, 'password'], ['otp', secret.otp, 'one-time code']]) {
-        if (!fields[which] || !value) continue;
-        // Approving in 1Password takes a while; the tab may have gone
-        // somewhere else meanwhile, and a login only goes to its own site.
-        backendIds.push((await cdp(tab, 'DOM.describeNode', { objectId: fields[which] })).node.backendNodeId);
-        const put = (await cdp(tab, 'Runtime.callFunctionOn', { objectId: fields[which], functionDeclaration: PUT_FIELD, arguments: [{ value }, { value: allowedFor(login) }], returnByValue: true })).result?.value;
-        if (put === 'site') throw new FillStopped(`the tab is no longer on a site "${login.title}" is saved for`);
-        // X keeps a hidden password box on its username step that goes once
-        // the username's in: what's typed so far is the step, not a failure.
-        if (put !== 'ok' && filled.length) break;
-        if (put !== 'ok') throw new FillStopped(`the page changed before fill could type the ${label}`);
-        filled.push(label);
-      }
-    } catch (e) {
-      // Whatever the page did meanwhile (a dialog, say) can carry what was
-      // typed, so only fill's own words go back.
-      throw e instanceof FillStopped ? new Error(`fill stopped: ${e.message}${filled.length ? ` (after the ${filled.join(', ')})` : ''}. Snap tab ${tab} to see where it is`) : new Error(`fill stopped in tab ${tab}${filled.length ? ` after the ${filled.join(', ')}` : ''}: the page changed or showed a dialog. Snap it to see where it is`);
-    } finally {
-      // The page as it is after typing: one that loaded in the meantime is
-      // the one holding the values.
-      if (backendIds.length) {
-        const loaderId = await cdp(tab, 'Page.getFrameTree').then((r) => r.frameTree.frame.loaderId, () => frameTree.frame.loaderId);
-        protectFilled(tab, loaderId, backendIds);
-      }
-    }
-    if (!filled.length) throw new Error(`"${login.title}" in 1Password has nothing for the fields on this page`);
-    if (submit) {
-      await markPage(tab);
-      await pressKey(tab, 'Enter').catch(() => {});
-      await settleAfterAction(tab).catch(() => {});
-    }
-    return `filled the ${filled.join(', ')} from 1Password ("${login.title}") in tab ${tab}${submit ? ' and pressed Enter' : "; press the page's sign-in button (or run fill again with --submit)"}. Snap it to see the next step.`;
-  },
-
   key: ({ tab, key }) =>
     orClosed(tab, async (sending) => {
       await markPage(tab);
@@ -2768,6 +2815,51 @@ const commands = {
   },
 
   // The page's text, for reading rather than acting. Long pages go to a file.
+  // Sign in from 1Password: see fillIn.
+  async fill(args) {
+    fillingTabs.add(args.tab);
+    fillCount.set(args.tab, (fillCount.get(args.tab) || 0) + 1);
+    try {
+      return await fillIn(args);
+    } finally {
+      fillingTabs.delete(args.tab);
+    }
+  },
+
+  // A key or token shown in the page, for the CLI to write to a file (cli.mjs,
+  // writeSecret), so it never goes through the agent's output. Inside frames
+  // too: AI Studio's key is in the Cloud console's, where eval can't see
+  // (19 Nov). The value goes back to the CLI only.
+  async secret({ tab, ref, css, text, nth }) {
+    // script: a hidden match is taken where it is, without hovering. Its
+    // notes and errors quote what the element says, which is the key, so
+    // they're left out or have their quotes emptied.
+    // The arguments are checked here, so that every error from finding it
+    // can be one of these fixed ones: the page can put words in any other
+    // (Codex's review).
+    if (css === true || text === true) throw new Error(`--${css === true ? 'css' : 'text'} needs a value`);
+    if (nth !== undefined && !(Number.isInteger(nth) && nth > 0)) throw new Error('--nth takes a number from 1');
+    if (!ref && !css && !text) throw new Error('say what holds the key: a ref from browserbear snap (e12), --css <selector> or --text <text>');
+    if (ref && isRef(ref) && !css && !text) await nodeFor(tab, ref);
+    const found = await resolveTarget(tab, { ref, css, text, nth, script: true }, () => {}).catch((e) => {
+      const several = /^in tab \d+, .* matches (\d+)/.exec(e.message)?.[1];
+      if (several) throw new Error(`in tab ${tab}, that matches several elements; snap it and give the ref, or add --nth`);
+      throw new Error(`in tab ${tab}, that couldn't be picked out as one element (nothing matched, or the page got in the way); snap it and give the ref`);
+    });
+    // Nor any error from reading it: a page's own (a dialog it opens, a value
+    // getter that throws) can say anything (Codex's review).
+    const result = await (async () => {
+      const { object } = await cdp(tab, 'DOM.resolveNode', { backendNodeId: found.node });
+      return (await cdp(tab, 'Runtime.callFunctionOn', { objectId: object.objectId, functionDeclaration: READ_SECRET, returnByValue: true })).result;
+    })().catch(() => {
+      throw new Error(`in tab ${tab}, that element couldn't be read (the page may have changed, or opened a dialog); snap it to see`);
+    });
+    const value = typeof result?.value === 'string' ? result.value.trim() : '';
+    if (!value) throw new Error(`${found.ref || 'that'} in tab ${tab} is empty, so nothing was written. A key a page hides until "Show key" is clicked needs that first`);
+    if (/\s/.test(value)) throw new Error(`${found.ref || 'that'} in tab ${tab} holds more than one word, so it isn't just the key and nothing was written. Point at the field or element with the key alone`);
+    return { secret: value };
+  },
+
   async read({ tab, max = 4000 }) {
     // Straight after a click that navigates, there may be no body yet, or no
     // page to evaluate in at all (passport.service.gov.uk, 30 Oct): wait for
@@ -2793,6 +2885,8 @@ const commands = {
     frames.forEach(([, f], i) => {
       if (typeof inner[i] === 'string' && inner[i].trim()) text += `\n\n[frame ${hostOf(f.url) || f.url}]\n${inner[i]}`;
     });
+    // Before it's cut, so a key at the cut isn't left half shown.
+    text = redact(text);
     if (text.length <= max) return text;
     const file = path.join(OUT, `tab-${tab}-${Date.now()}.txt`);
     fs.writeFileSync(file, text, { mode: 0o600 });
@@ -3052,20 +3146,58 @@ class FillStopped extends Error {}
 
 // Tabs fill has typed into: the page it typed on, and the fields, so the
 // values can't be read straight back with eval, cdp or a snapshot.
-const filledTabs = new Map(); // tabId -> { loaderId, nodes: Set<backendNodeId> }
+// Kept on disk, as the service restarts by itself when its code changes, and
+// forgetting would let eval or secret read a filled password straight back
+// (Codex's review, 19 Nov).
+// Written whole and renamed in. One that can't be read back (not just
+// missing) means BrowserBear can't tell which pages fill typed on, so reading
+// pages back is off everywhere until it's sorted (fillUnknown).
+const FILLED = path.join(HOME, 'filled-tabs.json');
+let fillUnknown = false;
+const filledTabs = new Map((() => {
+  try {
+    return JSON.parse(fs.readFileSync(FILLED, 'utf8')).map(([tab, f]) => [tab, { loaderId: f.loaderId, nodes: new Set(f.nodes) }]);
+  } catch (e) {
+    if (e.code !== 'ENOENT') fillUnknown = true;
+    return [];
+  }
+})()); // tabId -> { loaderId, nodes: Set<backendNodeId> }
+const saveFilled = () => {
+  const tmp = `${FILLED}.${process.pid}.tmp`;
+  try {
+    fs.writeFileSync(tmp, JSON.stringify([...filledTabs].map(([tab, f]) => [tab, { loaderId: f.loaderId, nodes: [...f.nodes] }])), { mode: 0o600 });
+    fs.renameSync(tmp, FILLED);
+    return true;
+  } catch (e) {
+    // Not saved: this service still knows, but one restarted wouldn't.
+    fillUnknown = true;
+    fs.rmSync(tmp, { force: true });
+    log('cannot save filled tabs:', e.message);
+    return false;
+  }
+};
+// Tabs fill is typing into right now, before protectFilled knows its fields,
+// and how many fills each has had, so a read that a fill ran alongside is
+// withheld even if the tab has moved on since (Codex's review).
+const fillingTabs = new Set();
+const fillCount = new Map();
 function protectFilled(tabId, loaderId, nodes) {
   const was = filledTabs.get(tabId);
   const set = was && was.loaderId === loaderId ? was.nodes : new Set();
   for (const n of nodes) set.add(n);
   filledTabs.set(tabId, { loaderId, nodes: set });
+  return saveFilled();
 }
 // The filled fields' ids while the tab is still on the page fill typed on.
 async function stillFilled(tabId) {
   const f = filledTabs.get(tabId);
   if (!f) return null;
   const now = await cdp(tabId, 'Page.getFrameTree').then((r) => r.frameTree.frame.loaderId, () => null);
+  // Only the record this looked at: a fill since may have made a newer one.
   if (now && now !== f.loaderId) {
+    if (filledTabs.get(tabId) !== f) return filledTabs.get(tabId)?.nodes || null;
     filledTabs.delete(tabId);
+    saveFilled();
     return null;
   }
   return f.nodes;
@@ -3173,7 +3305,7 @@ async function onClientMessage(conn, msg) {
       if (USES[msg.cmd] && owner.who && owner.who !== 'user') {
         using = args.tab;
         panel.remember(using, msg.thread, owner.p.instance);
-        marks.begin(using, msg.thread, USES[msg.cmd](args));
+        marks.begin(using, msg.thread, redact(USES[msg.cmd](args)));
       }
     }
     // Raw cdp that got past the refusals talks to the page anyway, so it turns
@@ -3182,9 +3314,17 @@ async function onClientMessage(conn, msg) {
     if (msg.cmd === 'cdp' && owner) await unlessAgents(args.tab, owner, { always: true });
     // After the ownership checks, so a tab that's become the user's loses its
     // emulation even on a page eval is off on (Codex's review).
-    if (['eval', 'cdp'].includes(msg.cmd) && typeof args.tab === 'number' && (await stillFilled(args.tab))) {
-      throw new Error(`${msg.cmd} is off in tab ${args.tab} until it leaves the page fill signed in on, so what was filled can't be read back. snap, click and key still work`);
-    }
+    // Asked again once it's done, in case fill typed while it ran: what it
+    // read, or its error, could hold the password (Codex's review).
+    const readsBack = ['eval', 'cdp', 'secret'].includes(msg.cmd) && typeof args.tab === 'number';
+    const refuseIfFilled = async () => {
+      if (!readsBack) return;
+      if (fillUnknown) throw new Error(`${msg.cmd} is off: BrowserBear lost track of which pages 1Password fill typed on (${FILLED} couldn't be read or saved), so nothing is read back from any tab. Once the signed-in tabs have moved on, the user can delete that file`);
+      if (fillingTabs.has(args.tab) || (await stillFilled(args.tab))) throw new Error(`${msg.cmd} is off in tab ${args.tab} until it leaves the page fill signed in on, so what was filled can't be read back. snap, click and key still work`);
+    };
+    // Counted before the first check, so a fill during it is caught too.
+    const fillsBefore = fillCount.get(args.tab);
+    await refuseIfFilled();
     let note;
     if (typeof args.tab === 'number' && WAKES.has(msg.cmd)) {
       if (await wake(args.tab, { draw: LOOKS_FIRST.has(msg.cmd), owner })) note = hiddenNote(args.tab);
@@ -3194,9 +3334,13 @@ async function onClientMessage(conn, msg) {
       // would wait 20 s on it and then block the navigation (Codex's review).
       await emulateFocus(args.tab).catch(() => {});
     }
-    conn.write(line({ id: msg.id, ok: true, result: await fn(args), note }));
+    const result = await fn(args).then((r) => ({ r }), (e) => ({ e }));
+    if (readsBack && fillCount.get(args.tab) !== fillsBefore) throw new Error(`${msg.cmd} in tab ${args.tab} ran while 1Password fill was signing in there, so what it read is withheld. Run it again`);
+    await refuseIfFilled();
+    if (result.e) throw result.e;
+    conn.write(line({ id: msg.id, ok: true, result: msg.cmd === 'secret' ? result.r : redact(result.r), note }));
   } catch (e) {
-    conn.write(line({ id: msg.id, ok: false, error: e.message }));
+    conn.write(line({ id: msg.id, ok: false, error: redact(e.message) }));
   } finally {
     busy--;
     if (using !== null) marks.end(using);

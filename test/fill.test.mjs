@@ -82,6 +82,7 @@ test("fill types the login into the agent's page and never prints it", async (t)
   // The values can't be read back on that page: no eval or cdp, and snapshots hide them.
   await fails(browserbear('eval', '7', 'document.title'), /eval is off in tab 7 until it leaves the page fill signed in on/);
   await fails(browserbear('cdp', '7', 'Runtime.evaluate', '{}'), /cdp is off in tab 7/);
+  await fails(browserbear('secret', '7', '--css', 'input[type=password]', '--to', '/tmp/bb-never-written'), /secret is off in tab 7/);
   const snap = await browserbear('snap', '7');
   assert.match(snap, /textbox "Email" = "••••"/);
   assert.doesNotMatch(snap, /user-bbb/);
