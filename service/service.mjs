@@ -704,12 +704,26 @@ async function hitsTarget(tabId, backendNodeId, at) {
   // turned real clicks into script clicks (17 Nov).
   const metrics = await cdp(tabId, 'Page.getLayoutMetrics', {}, PROBE_MS, frame).catch(() => null);
   const { pageX = 0, pageY = 0 } = metrics?.cssVisualViewport || {};
-  const hit = await cdp(tabId, 'DOM.getNodeForLocation', { x: Math.round(at.x + pageX), y: Math.round(at.y + pageY), ignorePointerEventsNone: true }, undefined, frame).catch(() => null);
+  const hit = await cdp(tabId, 'DOM.getNodeForLocation', { x: Math.round(at.x + pageX), y: Math.round(at.y + pageY), ignorePointerEventsNone: false }, undefined, frame).catch(() => null);
   if (!hit?.backendNodeId) return { ok: false, what: 'nothing' };
   if (hit.backendNodeId === id) return { ok: true };
+  // Only what takes clicks: ignorePointerEventsNone: true means hit-test
+  // pointer-events: none too, and so it found the Cloud console dialog's
+  // see-through ::before border over AI Studio's payment form (19 Nov).
+  // A pseudo-element that is hit stands for the element it belongs to: Chrome
+  // resolves one into no world the page's own objects share, and the check
+  // below then failed with "Argument should belong to the same JavaScript
+  // world as target object".
+  let hitId = hit.backendNodeId;
+  const hitNode = (await cdp(tabId, 'DOM.describeNode', { backendNodeId: frameNode(frame, hitId) }).catch(() => null))?.node;
+  if (hitNode?.pseudoType) {
+    hitId = await pseudoOwner(tabId, frame, hitId);
+    if (!hitId) return { ok: false, what: `a ::${hitNode.pseudoType} the page has since removed` };
+    if (hitId === id) return { ok: true };
+  }
   const [{ object: target }, { object: top }] = await Promise.all([
     cdp(tabId, 'DOM.resolveNode', { backendNodeId }),
-    cdp(tabId, 'DOM.resolveNode', { backendNodeId: frameNode(frame, hit.backendNodeId) }),
+    cdp(tabId, 'DOM.resolveNode', { backendNodeId: frameNode(frame, hitId) }),
   ]);
   const { result } = await cdp(tabId, 'Runtime.callFunctionOn', {
     objectId: target.objectId,
@@ -717,11 +731,36 @@ async function hitsTarget(tabId, backendNodeId, at) {
     functionDeclaration: `function (top) {
       const el = top.nodeType === 1 ? top : top.parentElement;
       if (this === el || this.contains(el)) return '';
+      // A label that's pointer-events: none (a button's text, which --text
+      // finds) is never hit; its button is, and gets the click as a person's would.
+      if (el.contains(this) && getComputedStyle(this).pointerEvents === 'none') return '';
       return (el.getAttribute('aria-label') || el.tagName.toLowerCase()) + (el.id ? '#' + el.id : '');
     }`,
     returnByValue: true,
+  }).catch((e) => {
+    // Anything else from another world (a document of its own in the frame)
+    // isn't the target, so it gets a script click rather than an error.
+    if (/same JavaScript world/.test(e.message)) return { result: { value: 'something in another document' } };
+    throw e;
   });
   return result.value ? { ok: false, what: result.value } : { ok: true };
+}
+
+// The element a pseudo-element belongs to, from the frame's whole tree, as
+// Chrome tells a pseudo-element's node nothing of its parent.
+async function pseudoOwner(tabId, frame, pseudo) {
+  const { root } = await cdp(tabId, 'DOM.getDocument', { depth: -1, pierce: true }, undefined, frame);
+  // Pseudo-elements can have their own (::before::marker).
+  const holds = (n) => n.pseudoElements?.some((x) => x.backendNodeId === pseudo || holds(x));
+  const find = (n) => {
+    if (holds(n)) return n.backendNodeId;
+    for (const c of [...(n.children || []), ...(n.shadowRoots || []), ...(n.contentDocument ? [n.contentDocument] : [])]) {
+      const got = find(c);
+      if (got) return got;
+    }
+    return null;
+  };
+  return find(root);
 }
 
 const within = async (tabId, backendNodeId, selector) => {
