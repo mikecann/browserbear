@@ -1450,7 +1450,9 @@ const isRef = (target) => /^e\d+$/.test(target);
 // match (a button that only shows while its card is hovered) is revealed by
 // hovering the nearest ancestor that's drawn.
 // peek: only whether a drawn match is there already, with no hovering.
-async function resolveTarget(tabId, { ref, css, text, nth, peek = false }, sending) {
+// script: the click will be a script one, which needs nothing drawn, so a
+// hidden match is clicked where it is rather than hovered into view.
+async function resolveTarget(tabId, { ref, css, text, nth, peek = false, script = false }, sending) {
   if (css === true || text === true) throw new Error(`--${css === true ? 'css' : 'text'} needs a value`);
   if (nth !== undefined && !(Number.isInteger(nth) && nth > 0)) throw new Error('--nth takes a number from 1');
   if (ref && isRef(ref) && !css && !text) return { node: await nodeFor(tabId, ref), ref, note: '' };
@@ -1495,6 +1497,12 @@ async function resolveTarget(tabId, { ref, css, text, nth, peek = false }, sendi
     const node = await backendOf(slot('0'));
     const named = state(tabId).refs.ref(node);
     if (!info.hidden) return { node, ref: named, note: `(${named} is ${info.desc}${where})` };
+    // eToro's collapsed side menu (19 Nov): hovering didn't show "Withdraw
+    // Funds", but a script click on its link worked. The click goes to what
+    // matched and bubbles up to the link around it, which follows it; clicking
+    // the link itself would change event.target, which delegated handlers
+    // check (Codex's review).
+    if (script) return { node, ref: named, hidden: true, note: `(${named} is ${info.desc}${where}, hidden, so it was clicked by script where it is, without showing it)` };
     const revealer = await backendOf(slot('1'));
     if (!revealer) throw new Error(`in tab ${tabId}, ${info.desc}${where} is hidden, and nothing around it is drawn to hover over`);
     const how = await hoverNode(tabId, revealer, sending);
@@ -1505,7 +1513,7 @@ async function resolveTarget(tabId, { ref, css, text, nth, peek = false }, sendi
       functionDeclaration: `function () { const r = this.getBoundingClientRect(); return r.width > 0 && r.height > 0 && this.checkVisibility({ opacityProperty: true, visibilityProperty: true }); }`,
       returnByValue: true,
     });
-    if (!result.value) throw new Error(`in tab ${tabId}, ${info.desc}${where} is hidden, and hovering over ${info.revealer} didn't show it${how ? ` ${how}` : ''}. If it opens on a click (a card or menu that shows its options when clicked), add --reveal "<the text of what opens it>" to click that first, or click it yourself and then this again`);
+    if (!result.value) throw new Error(`in tab ${tabId}, ${info.desc}${where} is hidden, and hovering over ${info.revealer} didn't show it${how ? ` ${how}` : ''}. If it opens on a click (a card or menu that shows its options when clicked), add --reveal "<the text of what opens it>" to click that first, or click it yourself and then this again. Or add --script to click it by script where it is, hidden (as a collapsed side menu's links need)`);
     return { node, ref: named, note: `(${named} is ${info.desc}${where}; it showed once the pointer was over ${info.revealer})` };
   } finally {
     for (const session of used) cdp(tabId, 'Runtime.releaseObjectGroup', { objectGroup: FIND_GROUP }, undefined, session).catch(() => {});
@@ -1769,11 +1777,13 @@ async function pressKey(tabId, combo) {
 // Text as real key presses, one character at a time. Not through pressKey, which
 // would take a "+" for a combination. Real input is held back on a tab you can't
 // see, so an agent's tab comes forward first; your own tabs aren't pulled forward.
-async function typeKeys(tabId, text) {
+// stay: called before each key, to stop once focus leaves the field.
+async function typeKeys(tabId, text, stay = null) {
   const p = await ownerOf(tabId);
   const tab = (await call(p, 'tabs')).find((t) => t.tabId === tabId);
   if (!tab?.active && bearTabs.has(tabId)) await call(p, 'show', { tabId });
   for (const key of text) {
+    if (stay) await stay();
     const k = charKey(key);
     const ev = { key, code: k.code, windowsVirtualKeyCode: k.keyCode, nativeVirtualKeyCode: k.keyCode };
     await cdp(tabId, 'Input.dispatchKeyEvent', { ...ev, type: 'keyDown', text: key });
@@ -1991,7 +2001,10 @@ async function typeChecked(tabId, node, text) {
   };
   await late();
   let note = '';
-  if (await unchanged()) {
+  // A number or email field can't say what was selected: one that holds just
+  // the text now was likely all selected and typed over with the same, and
+  // keys would put it in twice (Codex's review).
+  if (await unchanged() && !(before.unsure && after.value === text)) {
     // With no ref, the field is whatever had focus. If focus has gone somewhere
     // else, the text likely went there, and keys would put it in a second place.
     if (!node && !(await hasFocus(tabId, field))) throw new Error(`type didn't work on tab ${tabId}: the focused field still holds ${shown(before)}, and focus had moved off it, so ${JSON.stringify(text)} may have gone into another field. Nothing else was typed or submitted; snap to see, and type into the field by its ref`);
@@ -2006,11 +2019,43 @@ async function typeChecked(tabId, node, text) {
     after = (await read()) || after;
     note = '(the page ignored inserted text, so that was real key presses)';
   }
+  // In, but changed into something else: eToro's SWIFT box (19 Nov), masked as
+  // "XXXX AU XXXXX", put its own "AU" in front of inserted "NATAAU3303M" and
+  // held "AUNATAAU3303M", which has the text in it, so type said it worked.
+  // Keys one at a time went in right, so an empty field is cleared and gets
+  // them; one that held something isn't, as clearing it would lose that.
+  // Typed over a selection of the same text still has to come out as that text.
+  const right = (r) => fits(r.value, before.base, text, r.secret) || (before.unsure && (fits(r.value, '', text, r.secret) || typedOver(r.value, before.base, text)));
+  if (!note && !after.rich && !before.base && !right(after) && !doubled(before.base, after.value, text) && (node || (await hasFocus(tabId, field)))) {
+    const mangled = after.value;
+    if (node) await clickNode(tabId, node);
+    const gone = () => new Error(`type went wrong on tab ${tabId}: the page changed ${JSON.stringify(text)} into ${before.secret ? 'something else' : JSON.stringify(mangled)}, and focus left the field while it was being cleared or typed again as keys, so nothing more was typed or submitted. snap to see what it holds, and try browserbear key one character at a time`);
+    if (!(await hasFocus(tabId, field))) throw gone();
+    await pressKey(tabId, 'Meta+a');
+    if (!(await hasFocus(tabId, field))) throw gone();
+    await pressKey(tabId, 'Backspace');
+    await settle();
+    after = (await read()) || after;
+    if (after.value) throw new Error(`type went wrong on tab ${tabId}: the page changed ${JSON.stringify(text)} into ${shown({ ...after, value: mangled })}, and clearing it to type it again as keys left ${shown(after)}. Nothing was submitted; snap to see`);
+    // Clearing it, or a key (a full field moving on), can send focus to another
+    // field, which the rest of the keys would land in.
+    await typeKeys(tabId, text, async () => {
+      if (!(await hasFocus(tabId, field))) throw gone();
+    });
+    await settle();
+    await sleep(LATE_INPUT_MS);
+    after = (await read()) || after;
+    note = `(the page changed the inserted text into ${before.secret ? 'something else' : JSON.stringify(mangled)}, so it was cleared and typed again as real key presses)`;
+  }
   // One character kept out of several is what a code box does when typeSplit can't
   // see its neighbours (each in a shadow root of its own, say).
   const oneBox = [...after.value].length === 1 && bare(text).length > 1 ? ". If this is a row of one-character boxes, type each character into its own box by its ref" : '';
   if (!norm(text)(after.value).includes(norm(text)(text))) throw new Error(`type didn't work on tab ${tabId}: the field holds ${shown(after)}, which doesn't have ${JSON.stringify(text)} in it. Nothing was submitted. The page may have cut it short or changed it; snap to see${oneBox}`);
   if (doubled(before.base, after.value, text)) throw new Error(`type went wrong on tab ${tabId}: ${JSON.stringify(text)} went in more than once, and the field now holds ${shown(after)}. Nothing was submitted. If the field should hold just that text, browserbear type ${tabId} ${node ? '<ref>' : '-'} ${JSON.stringify(text)} --replace puts it in over what's there`);
+  // Only formatting may be added around the text (spaces, commas), not letters
+  // or digits of the page's own. A rich editor is left out: its base can't be
+  // read as exactly.
+  if (!after.rich && !right(after)) throw new Error(`type went wrong on tab ${tabId}: the field holds ${shown(after)}, which isn't ${before.base ? `what it held plus ` : ''}${JSON.stringify(text)}: the page added to it or changed it (a mask's fixed letters, say, an autocomplete, or a sign or separator dropped). Nothing was submitted. snap to see; if it should hold just that text, browserbear type ${tabId} ${node ? '<ref>' : '-'} ${JSON.stringify(text)} --replace puts it in over what's there, and browserbear key types one key at a time`);
   // A rich editor's text isn't in the snapshot, so say what it holds now.
   if (after.rich) note = [note, `(the field now holds ${JSON.stringify(clip(flatten(after.value)))})`].filter(Boolean).join('\n');
   return note;
@@ -2041,19 +2086,22 @@ const watchField = (tabId, field, text) =>
         setTimeout(() => seen.disconnect(), 30000);
       }
       // base: what's left once the selection goes, which is what one copy goes into.
-      let noOp = false, base = field.value ?? field.innerText;
+      // unsure: an input with no selection to read (number, email), so whatever
+      // it held may have been selected and typed over.
+      let noOp = false, unsure = false, base = field.value ?? field.innerText;
       try {
+        unsure = field.value !== undefined && field.selectionStart === null;
         if (field.value !== undefined && field.selectionStart !== field.selectionEnd) {
           noOp = field.value.slice(field.selectionStart, field.selectionEnd) === text;
           base = field.value.slice(0, field.selectionStart) + field.value.slice(field.selectionEnd);
         }
-      } catch {}
+      } catch { unsure = field.value !== undefined; }
       if (field.value === undefined) {
         const picked = field.ownerDocument.getSelection().toString();
         if (picked.trim() && picked.replace(/\\s+/g, '') === field.innerText.replace(/\\s+/g, '')) base = '';
         else if (picked.trim() && field.contains(field.ownerDocument.getSelection().anchorNode)) base = field.innerText.replace(picked, '');
       }
-      ${READ_FIELD.replace('return {', 'return { noOp, base,')}
+      ${READ_FIELD.replace('return {', 'return { noOp, unsure, base,')}
     }`,
     arguments: [{ value: text }],
     returnByValue: true,
@@ -2080,6 +2128,54 @@ const doubled = (before, after, text) => {
   const count = (s) => [...s].reduce((m, c) => m.set(c, (m.get(c) || 0) + 1), new Map());
   const [cb, ca, ct] = [count(b), count(a), count(t)];
   return t.length > 0 && a.length - b.length === 2 * t.length && [...ct].every(([c, k]) => (ca.get(c) || 0) - (cb.get(c) || 0) >= 2 * k);
+};
+// Whether value is base with the text put in somewhere, and nothing else
+// besides formatting the page added: spaces, commas, dashes, slashes, brackets,
+// letter case. Every character typed stays, in its place, so "-100" coming out
+// as "100", "1,23" as "123" or "12,3", or "10.00" as "1000", is a different
+// amount; and a sign at either end must be the one typed, not one the page
+// added (Codex's reviews). A password is compared exactly: its punctuation and
+// case are the password.
+// A dash the page adds only counts as formatting between two digits or two
+// letters ("0412-345"), not as a sign: "$100" coming out as "$-100", or "1e3"
+// as "1e-3", is another number (Codex's review).
+const FORMATTING = /[\s,\-_/()'’]/;
+const formattedFrom = (value, want) => {
+  const w = [...want.toLowerCase().replace(/\s+/g, '')];
+  const v = [...value.toLowerCase().replace(/\s+/g, '')];
+  const kind = (c) => (/\p{N}/u.test(c ?? '') ? 'n' : /\p{L}/u.test(c ?? '') ? 'l' : '');
+  let j = 0;
+  for (const [i, c] of v.entries()) {
+    if (j < w.length && c === w[j]) j++;
+    else if (!FORMATTING.test(c)) return false;
+    else if (c === '-' && !(kind(v[i - 1]) && kind(v[i - 1]) === kind(v[i + 1]))) return false;
+    // A comma or apostrophe the page adds next to a digit groups thousands, so
+    // exactly three digits follow: "123" coming out as "1,23" is 1.23 on a page
+    // with decimal commas (Codex's review).
+    else if (/[,'’]/.test(c) && (kind(v[i - 1]) === 'n' || kind(v[i + 1]) === 'n') && !(kind(v[i - 1]) === 'n' && /^\p{N}{3}(?!\p{N})/u.test(v.slice(i + 1).join('')))) return false;
+  }
+  return j === w.length;
+};
+// What a field held is the page's to regroup: "1,234" with 5 typed after it is "12,345".
+const ungroup = (s) => s.replace(/[\s,'’_]/g, '');
+const sign = (s) => `${/^\s*[-−(+]/.test(s) ? s.trim()[0] : ''}|${/[-−)]\s*$/.test(s) ? s.trim().slice(-1) : ''}`;
+const fits = (value, base, text, secret = false) => {
+  // Long text: where it went is found from the letters and digits alone.
+  if (base.length > 2000) {
+    const [a, b, t] = [bare(value), bare(base), bare(text)];
+    return a.length === b.length + t.length && [...Array(b.length + 1).keys()].some((i) => a.startsWith(t, i) && a.slice(0, i) + a.slice(i + t.length) === b);
+  }
+  return Array.from({ length: base.length + 1 }, (_, i) => i).some((i) => {
+    const want = base.slice(0, i) + text + base.slice(i);
+    return secret ? value === want : sign(value) === sign(want) && formattedFrom(value, ungroup(base.slice(0, i)) + text + ungroup(base.slice(i)));
+  });
+};
+// For a field that can't say what was selected (number, email): value is base
+// with some stretch of it, perhaps all, typed over with the text, exactly.
+const typedOver = (value, base, text) => {
+  if (base.length > 300) return false;
+  for (let i = 0; i <= base.length; i++) for (let k = i; k <= base.length; k++) if (value === base.slice(0, i) + text + base.slice(k)) return true;
+  return false;
 };
 const clip = (s) => (s.length > 300 ? `${s.slice(0, 300)}…` : s);
 
@@ -2110,17 +2206,22 @@ const holds = (read, text) => (read.rich ? flatten(read.value) === flatten(text)
 // --submit, so a wrong value doesn't get sent.
 async function replaceText(tabId, node, text) {
   const insert = () => (text ? cdp(tabId, 'Input.insertText', { text }) : pressKey(tabId, 'Backspace'));
+  // Formatting the page adds (eToro's SWIFT box grouping it, "ANZB AU 3M") is fine.
+  const took = (r) => holds(r, text) || (!r.rich && fits(r.value, '', text, r.secret));
+  // The field it starts in, held on to: with -, a read follows focus, which a
+  // page can move on (Codex's review).
+  const field = text ? await pinField(tabId, node).catch(unlessCutOff) : null;
   if (await onField(tabId, node, SELECT_FIELD).catch(() => null)) {
     await insert();
     await settle();
     // Given a moment, as in typeChecked: an editor that shows it late would
     // otherwise get it again below, and end up with it twice.
     let read = await onField(tabId, node, READ_FIELD);
-    for (let waited = 0; read && !holds(read, text) && waited < LATE_INPUT_MS; waited += 150) {
+    for (let waited = 0; read && !took(read) && waited < LATE_INPUT_MS; waited += 150) {
       await sleep(150);
       read = await onField(tabId, node, READ_FIELD);
     }
-    if (read && holds(read, text)) return '';
+    if (read && took(read)) return '';
   }
   if (node) await clickNode(tabId, node);
   await pressKey(tabId, 'Meta+a');
@@ -2130,9 +2231,26 @@ async function replaceText(tabId, node, text) {
   if (text) await cdp(tabId, 'Input.insertText', { text });
   await settle();
   let read = await onField(tabId, node, READ_FIELD);
-  // Ignored the inserted text, as a masked field does (see typeChecked).
-  if (text && read && read.value === cleared?.value) {
-    await typeKeys(tabId, text);
+  // Ignored the inserted text, as a masked field does, or changed it, as
+  // eToro's SWIFT box did (see typeChecked): then real keys.
+  if (text && read && (read.value === cleared?.value || (!read.rich && !fits(read.value, '', text, read.secret)))) {
+    // Held on to, and checked for focus around the clearing: a page that moves
+    // focus on would get the keys in another field, and -'s read would follow it
+    // there and call it done (Codex's review).
+    const astray = () => new Error(`--replace went wrong on tab ${tabId}: the page changed the inserted text into ${shown(read)}, and focus left the field while it was being cleared or typed again as keys, so nothing more was typed or submitted. snap to see what it holds, and try browserbear key one character at a time`);
+    if (field && !(await hasFocus(tabId, field))) throw astray();
+    if (read.value !== cleared?.value) {
+      await pressKey(tabId, 'Meta+a');
+      if (field && !(await hasFocus(tabId, field))) throw astray();
+      await pressKey(tabId, 'Backspace');
+      await settle();
+      const now = field ? await readPinned(tabId, field).catch(unlessStuck) : null;
+      if (field && !(await hasFocus(tabId, field))) throw astray();
+      if (now?.value) throw new Error(`--replace went wrong on tab ${tabId}: the page changed the inserted text into ${shown(read)}, and clearing it to type again as keys left ${shown(now)}. Nothing was submitted; snap to see`);
+    }
+    await typeKeys(tabId, text, async () => {
+      if (field && !(await hasFocus(tabId, field))) throw astray();
+    });
     await settle();
     read = await onField(tabId, node, READ_FIELD);
   }
@@ -2140,11 +2258,11 @@ async function replaceText(tabId, node, text) {
   if (!read) return "(this editor can't be read back, so check below that the text was replaced)";
   // Still holding it a moment later: the first attempt's text turning up late
   // would land on top of this one.
-  if (holds(read, text)) {
+  if (took(read)) {
     await sleep(LATE_INPUT_MS);
     read = (await onField(tabId, node, READ_FIELD)) || read;
   }
-  if (holds(read, text)) return '';
+  if (took(read)) return '';
   throw new Error(`--replace didn't work on tab ${tabId}: the field holds ${shown(read)}, not ${JSON.stringify(text)}. Nothing was submitted. The page may have changed or reformatted it; snap to see`);
 }
 
@@ -2443,11 +2561,12 @@ const commands = {
           opened = [`(clicked ${opener.ref} first to show it: ${opener.note.replace(/^\(\S+ is |\)$/g, '')})`, how].filter(Boolean).join('\n');
         }
       }
-      const found = await resolveTarget(tab, { ref: given, css, text, nth }, sending);
+      const found = await resolveTarget(tab, { ref: given, css, text, nth, script }, sending);
       const { node, ref } = found;
       // Found by --css or --text, or listed as a plain clickable: a <div> may
       // only take clicks once it's hovered, as the user's mouse would have.
-      const hover = !!(css || text || !isRef(given)) || listedClickable(tab, ref);
+      // Not a hidden one clicked by script: hovering could make its menu redraw it.
+      const hover = !(script && found.hidden) && (!!(css || text || !isRef(given)) || listedClickable(tab, ref));
       await markPage(tab);
       const note = [opened, found.note, await clickNode(tab, node, { script, hover, sending })].filter(Boolean).join('\n');
       await settleAfterAction(tab);

@@ -30,10 +30,16 @@ const USAGE = `browserbear: let agents use your real Chrome profiles
                                                 listing them, unless --nth picks one. Prints the ref it got.
                                                 --reveal <text>: click what has that text first, for options a
                                                 card or menu only shows once it's clicked (skipped if they show)
+                                                --script: no hovering; a hidden match (a collapsed side menu's
+                                                link) is clicked by script where it is, without showing it
   browserbear hover <tab> <ref> | --text <text> | --css <selector> [--nth n]
                                                 put the pointer over it, for menus and buttons that show on hover
   browserbear type <tab> <ref|-> <text> [--submit] [--replace]
-                                                fails if the text does not end up in the field
+                                                fails unless the field ends up holding the text, with nothing
+                                                added but formatting (spaces, commas, dashes; none of the
+                                                text's own signs or separators lost). A page that
+                                                changes inserted text (a mask adding its own letters) gets it
+                                                again as real key presses, if the field was empty
   browserbear key <tab> <key>                   Enter, Escape, Tab, Home, End, F1-F12, Meta+a, Shift+Enter (a line
                                                 break), ... A name it doesn't know is an error, never typed
   browserbear goto <tab> <url>

@@ -66,12 +66,16 @@ browserbear CLI (or Threadbear)
   box, leaving out spaces and dashes, and reads it back.
 - `type` reads the field back. If inserted text changed nothing after a couple of
   seconds it uses real key presses, as a masked amount field needs, and if the field
-  still hasn't changed, doesn't end up with the text in it, or has it in twice, that's
-  an error, before any `--submit`. With `-`, it won't fall back to keys once focus has
+  still hasn't changed, doesn't end up with the text in it, has it in twice, or has
+  anything the page added beyond formatting (spaces, thousands commas, dashes between
+  digits) or a typed character lost or moved (a sign, a decimal point or comma), that's
+  an error, before any `--submit`. An empty field whose page changed the inserted text
+  (eToro's SWIFT box put its own "AU" in front) is cleared and gets real keys instead. With `-`, it won't fall back to keys once focus has
   left the field. A rich editor's text is printed, since the snapshot doesn't show it.
 - `type --replace` puts the text in over a selection as one edit, since a controlled
   field can restore its old value the moment it's emptied. It then reads the field back
-  and fails, before any `--submit`, unless it holds exactly that text.
+  and fails, before any `--submit`, unless it holds that text, give or take spaces,
+  commas and dashes. Inserted text the page changed gets real keys, as with `type`.
 - Chrome won't let a debugger into a tab holding another extension's frame (a password
   manager's inline menu), so the extension blanks those frames and gets back in. That
   needs the `scripting` permission. It has to scan the page's DOM to find them, shadow
