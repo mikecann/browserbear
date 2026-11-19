@@ -915,6 +915,9 @@ async function unlessAgents(tabId, owner, { always = false } = {}) {
 // saves one to a file instead. Screenshots still show them.
 const KEY_FORMATS = [
   /AIza[0-9A-Za-z_-]{35}/g, // Google
+  // Google's newer Gemini keys (AI Studio, 19 Nov 2026): "AQ." and about 50
+  // more. Long and unbroken, so "FAQ." and the like don't count.
+  /(?<![A-Za-z0-9._-])AQ\.[A-Za-z0-9_-][A-Za-z0-9._-]{38,}[A-Za-z0-9_-]/g, // not a full stop after it
   /(?<![A-Za-z0-9])sk-(?:ant-|proj-)?[A-Za-z0-9_-]{20,}/g, // Anthropic, OpenAI and others
   /(?<![A-Za-z0-9])(?:sk|rk)_(?:live|test)_[A-Za-z0-9]{16,}/g, // Stripe
   /(?<![A-Za-z0-9])gh[pousr]_[A-Za-z0-9]{36,}|github_pat_[A-Za-z0-9_]{22,}/g, // GitHub
@@ -922,7 +925,7 @@ const KEY_FORMATS = [
   /(?<![A-Z0-9])AKIA[0-9A-Z]{16}(?![A-Z0-9])/g, // AWS
 ];
 // The start of one, cut short where a long name is clipped with "…".
-const KEY_CLIPPED = /(?:AIza|(?<![A-Za-z0-9])(?:sk-|(?:sk|rk)_(?:live|test)_|gh[pousr]_|github_pat_|xox[abposr]-)|(?<![A-Z0-9])AKIA)[A-Za-z0-9_-]{4,}(?=…)/g;
+const KEY_CLIPPED = /(?:AIza|(?<![A-Za-z0-9._-])AQ\.|(?<![A-Za-z0-9])(?:sk-|(?:sk|rk)_(?:live|test)_|gh[pousr]_|github_pat_|xox[abposr]-)|(?<![A-Z0-9])AKIA)[A-Za-z0-9._-]{4,}(?=…)/g;
 const redactText = (text) =>
   // Clipped ones first: a long key cut short can still look whole, and its
   // "end" would be from the middle (Codex's review).

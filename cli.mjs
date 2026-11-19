@@ -62,7 +62,7 @@ const USAGE = `browserbear: let agents use your real Chrome profiles
                                                 (made in a 700 folder if it's new), and prints only its length
                                                 and last 4 characters, so it never goes through your output.
                                                 --replace writes over a key file that's there. Keys in common
-                                                formats (AIza…, sk-…, ghp_…) are blanked in everything else
+                                                formats (AIza…, AQ.…, sk-…, ghp_…) are blanked in everything else
                                                 BrowserBear prints
   browserbear dialog <tab> accept|dismiss [text]
   browserbear show <tab>                        bring a tab forward in its window (real clicks need it)

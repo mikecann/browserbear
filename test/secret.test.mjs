@@ -14,6 +14,8 @@ import { CFT, extensionInChrome, startBear } from './harness.mjs';
 // Made up, in Google's format, so snap blanks it.
 const KEY = 'AIzaSyD3m0-Fak3Key_ForBrowserBearTest01';
 const TOKEN = 'tok-7Hq2Lx9Pz4';
+// Google's newer kind (AI Studio, 19 Nov 2026), made up too.
+const AQ_KEY = 'AQ.Ab8RN6Lq_fakeKeyForBrowserBear-Test.x9Zk2Pw7Qm4Vt1Ys3';
 
 const FRAME = `<!doctype html><title>Credentials</title>
 <label>API key <input id="key" readonly value="${KEY}"></label>
@@ -22,7 +24,8 @@ const FRAME = `<!doctype html><title>Credentials</title>
 <p id="empty"></p>
 <p>Quoted: <span>"${TOKEN}"</span></p>
 <button>Copy the key for the Gemini Reviews project in AI Studio now ${KEY}</button>
-<p id="words">two words</p>`;
+<p id="words">two words</p>
+<p>New kind: <span id="aq">${AQ_KEY}</span>. See the FAQ.html page, or AQ. for short.</p>`;
 
 test('secret writes a key from a cross-origin frame to a private file, printing only its end', { skip: !CFT && 'no Chrome for Testing' }, async (t) => {
   const frames = http.createServer((req, res) => {
@@ -63,6 +66,10 @@ test('secret writes a key from a cross-origin frame to a private file, printing 
   assert.doesNotMatch(await browserbear('eval', TAB, `JSON.parse('['.repeat(60) + '"${KEY}"' + ']'.repeat(60))`), new RegExp(KEY));
   assert.match(snap, /button "Copy the key [^"]*\[part of a key\]…"/);
   assert.doesNotMatch(snap, /AIzaSy/);
+  // The newer AQ. kind too, and not ordinary text that happens to have "AQ." in it.
+  assert.doesNotMatch(text, new RegExp(AQ_KEY.replace(/\./g, '\\.')));
+  assert.match(text, /New kind: \[a key ending 1Ys3; browserbear secret saves it to a file\]\. See the FAQ\.html page, or AQ\. for short\./);
+  assert.doesNotMatch(await browserbear('eval', TAB, `'${AQ_KEY}'`), /fakeKey/);
   const ref = snap.match(/(e\d+) textbox "API key"/)[1];
 
   // A field's value, by ref, into a new folder: 700, the file 600.

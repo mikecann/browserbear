@@ -290,7 +290,7 @@ shows (a field's value or an element's text, iframes included, like AI Studio's
 in the Cloud console's frame) and writes it to a file only you can read, in a
 folder only you can open if it makes one. It prints the key's length and last 4
 characters, never the key, so it stays out of the agent's transcript; `--replace`
-writes a new key over the old file. Keys in common formats (Google's `AIza…`,
+writes a new key over the old file. Keys in common formats (Google's `AIza…` and `AQ.…`,
 `sk-…`, GitHub's `ghp_…`, Slack's `xox…`, Stripe's and AWS's) are blanked in
 everything else BrowserBear prints: snap, read, click diffs, eval and errors.
 Screenshots still show them.
