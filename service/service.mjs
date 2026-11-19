@@ -150,6 +150,9 @@ async function findProfile(want) {
   const connected = () => [...profiles.values()];
   const find = () => {
     const hits = connected().filter((p) => isCalled(p, w));
+    // Two copies of the extension in one profile (findTwins).
+    const twin = twinPick(hits);
+    if (twin) return twin;
     // Chrome lets two profiles share a name.
     if (hits.length > 1) throw new Error(`"${want}" could be any of ${hits.map(describe).join(', ')}; use the email`);
     return hits[0];
@@ -267,22 +270,41 @@ async function ownerOf(tabId) {
   // CDP call, so a tab id that's also one of Mike's (the agent's start at
   // 1001) can't end up in his profile (Codex review, 6 Nov).
   if (agentOnlyOn()) {
+    if (!profiles.has(AGENT_INSTANCE) && (Date.now() - STARTED_AT < RECONNECT_MS || Date.now() - (seen.drops.get(AGENT_INSTANCE) ?? 0) < RECONNECT_MS)) {
+      for (const until = Date.now() + RECONNECT_MS; Date.now() < until && !profiles.has(AGENT_INSTANCE); ) await sleep(250);
+    }
     const agent = profiles.get(AGENT_INSTANCE);
     if (agent && (tabOwner.get(tabId) === AGENT_INSTANCE || (await call(agent, 'tabs')).some((t) => t.tabId === tabId))) {
       tabOwner.set(tabId, AGENT_INSTANCE);
       return agent;
     }
+    // One of the agent's that has gone gets told why, not refused.
+    if (seen.tabs.get(tabId)?.instance === AGENT_INSTANCE) throw await goneError(tabId);
     throw agentOnlyRefusal(`it won't work in tab ${tabId}, which isn't in the agent's Chrome`);
   }
   const known = profiles.get(tabOwner.get(tabId));
   if (known) return known;
-  for (const p of profiles.values()) {
-    const tabs = await call(p, 'tabs');
-    for (const t of tabs) tabOwner.set(t.tabId, p.instance);
+  const was = tabOwner.get(tabId) ?? seen.tabs.get(tabId)?.instance;
+  // Its profile may only be reconnecting: every host drops for a moment when
+  // the service restarts (as it does whenever its code changes), and tab ids
+  // last until Chrome quits, so the tab is still there once it's back. Waited
+  // for first, so another profile that doesn't answer can't hold it up.
+  const recent = (at) => Date.now() - at < RECONNECT_MS;
+  if (was && !profiles.has(was) && (recent(STARTED_AT) || recent(seen.drops.get(was) ?? 0))) {
+    for (const until = Date.now() + RECONNECT_MS; Date.now() < until && !profiles.has(was); ) await sleep(250);
   }
+  // The profile it was last seen in first, then the rest at once: one that
+  // doesn't answer mustn't fail a tab that's in another.
+  const unanswered = [];
+  const ask = (p) => call(p, 'tabs').then((tabs) => tabs.forEach((t) => remember(p.instance, t)), (e) => unanswered.push(e));
+  if (profiles.has(was)) await ask(profiles.get(was));
+  if (!profiles.get(tabOwner.get(tabId))) await Promise.all([...profiles.values()].filter((p) => p.instance !== was).map(ask));
   const found = profiles.get(tabOwner.get(tabId));
-  if (!found) throw new Error(`no tab ${tabId} in any connected profile (browserbear tabs lists them)`);
-  return found;
+  if (found) return found;
+  // A profile that didn't answer may have it: that's not a tab that closed
+  // (handoff --wait would end, saying you'd closed it).
+  if (unanswered.length) throw unanswered[0];
+  throw await goneError(tabId);
 }
 
 // Whose a tab is: 'agent' when an agent opened it and still has it (it's in
@@ -296,7 +318,8 @@ async function whose(tabId) {
   const p = await ownerOf(tabId);
   const tabs = await call(p, 'tabs');
   const t = tabs.find((x) => x.tabId === tabId);
-  if (!t) throw Object.assign(new Error(closedMessage(tabId)), { closed: true });
+  if (!t) throw await goneError(tabId);
+  if (agentsTab(t)) sawTab(p.instance, t);
   if (handed.has(tabId)) return { who: 'handed', t, p };
   if (t.agent === undefined) return { who: bearTabs.has(tabId) ? 'agent' : null, t, p };
   if (t.bear !== false) {
@@ -350,7 +373,135 @@ function refuseUserTab(cmd, tabId, { who, left, t }) {
   );
 }
 
-const closedMessage = (tabId) => `tab ${tabId} has closed, so there's nothing left to act on. browserbear tabs lists what's open`;
+// Agents' tabs as last seen, and when each profile last dropped, so an agent
+// whose tab has gone hears why, not just "no tab". On 19 Nov 2026 an agent's
+// Zoho tab vanished three ways in ten minutes: the page closed it, Chrome
+// crashed (every profile dropped at once and came back with new tab ids),
+// and the page closed it again. On disk, as the service restarts whenever
+// its code changes, which it did a second after the crash.
+const SEEN = path.join(HOME, 'seen-tabs.json');
+const STARTED_AT = Date.now();
+const RECONNECT_MS = 10_000;
+const SEEN_MAX = 300;
+const SEEN_DAYS_MS = 2 * 24 * 3600_000;
+const seen = (() => {
+  try {
+    const { tabs, drops } = JSON.parse(fs.readFileSync(SEEN, 'utf8'));
+    return { tabs: new Map(tabs), drops: new Map(drops) };
+  } catch {
+    return { tabs: new Map(), drops: new Map() };
+  }
+})();
+let seenTimer = null;
+// now: a profile dropping, which the service may restart a moment after
+// (Chrome's crash on 19 Nov came a second before a code change).
+function saveSeen(now = false) {
+  if (now) {
+    clearTimeout(seenTimer);
+    seenTimer = null;
+    return writeSeen();
+  }
+  seenTimer ||= setTimeout(() => {
+    seenTimer = null;
+    writeSeen();
+  }, 1000);
+}
+// The service exits as soon as its code changes, which can be inside that second.
+process.on('exit', () => seenTimer && writeSeen());
+function writeSeen() {
+  // Two days is plenty to explain a tab that went; older ones are dropped.
+  const tabs = [...seen.tabs].filter(([, v]) => Date.now() - v.at < SEEN_DAYS_MS).sort((a, b) => a[1].at - b[1].at).slice(-SEEN_MAX);
+  seen.tabs = new Map(tabs);
+  try { fs.writeFileSync(SEEN, JSON.stringify({ tabs, drops: [...seen.drops] }), { mode: 0o600 }); } catch (e) { log('cannot save seen tabs:', e.message); }
+}
+// Only the page's address, not its query or fragment, where reset links and
+// sign-in redirects carry their tokens: this outlives the tab, on disk.
+const bareUrl = (url) => {
+  try {
+    const u = new URL(url);
+    // No hint for other pages: "file:" alone would match any file of the user's.
+    return u.protocol === 'http:' || u.protocol === 'https:' ? `${u.origin}${u.pathname}` : '';
+  } catch {
+    return '';
+  }
+};
+// One to remember: the extension says an agent opened it (or is too old to
+// say, and BrowserBear opened it), or it was lent. Not a bare id match: ids
+// from the agents' browser can collide with the user's.
+const agentsTab = (t) => t.agent === true || (t.agent === undefined && bearTabs.has(t.tabId)) || claimed.has(t.tabId);
+function sawTab(instance, t) {
+  const p = profiles.get(instance);
+  seen.tabs.set(t.tabId, { instance, profile: p ? describe(p) : instance, url: redact(bareUrl(t.url || '')), title: redact(t.title || '').slice(0, 80), at: Date.now() });
+  saveSeen();
+}
+
+const clock = (at) => new Date(at).toLocaleTimeString('en-GB', { hour12: false });
+
+// When Chrome crashed between two times, from macOS's crash reports.
+function chromeCrashBetween(from, to) {
+  const dir = path.join(os.homedir(), 'Library', 'Logs', 'DiagnosticReports');
+  try {
+    for (const f of fs.readdirSync(dir)) {
+      if (!/^Google Chrome-\d{4}-\d\d-\d\d-\d{6}\.ips$/.test(f)) continue;
+      const at = fs.statSync(path.join(dir, f)).mtimeMs;
+      // A report is written just after the crash, so a little after `to`.
+      if (at >= from && at <= to + 60_000) return at;
+    }
+  } catch {}
+  return null;
+}
+
+// The error for a tab that isn't there: what happened to it, as far as can be
+// told, and where the same page is open now, if it is.
+async function goneError(tabId) {
+  // What was seen of it, unless it was in another profile from the one that
+  // has it now (an id from an earlier Chrome run, two days' worth are kept).
+  const owner = tabOwner.get(tabId);
+  const kept = seen.tabs.get(tabId);
+  let last = kept && (!owner || owner === kept.instance) ? kept : null;
+  let p = profiles.get(last?.instance ?? owner);
+  // Agent-only: nothing about the user's own profiles, asked or told.
+  if (agentOnlyOn() && (last?.instance ?? owner) !== AGENT_INSTANCE) {
+    last = kept?.instance === AGENT_INSTANCE ? kept : null;
+    p = last ? profiles.get(AGENT_INSTANCE) : null;
+  }
+  const what = last ? `tab ${tabId} ("${last.title}" <${last.url.slice(0, 100)}>, in ${last.profile})` : `tab ${tabId}`;
+  let why = null;
+  if (p) {
+    const closed = await call(p, 'closed', { tabId }, 5_000).catch(() => null);
+    if (closed?.why === 'browserbear') why = `was closed with browserbear close at ${clock(closed.at)}`;
+    else if (closed?.why === 'window') why = `closed at ${clock(closed.at)} with its whole window (someone closed the window, or that Chrome profile shut)`;
+    else if (closed) why = `was closed at ${clock(closed.at)}, by the user or by the page itself (a popup closing when it's done)`;
+    else if (last) {
+      const started = await call(p, 'started', {}, 5_000).catch(() => null);
+      if (typeof started === 'number' && started > last.at) {
+        const crash = chromeCrashBetween(last.at, started);
+        why = `${crash ? `went when Chrome crashed at ${clock(crash)}` : `went when Chrome (or that profile) quit`}. ${p.instance === AGENT_INSTANCE ? 'The browser' : 'Chrome'} started again at ${clock(started)}, and tabs it restores get new ids`;
+      }
+    }
+  } else if (last) {
+    const drop = seen.drops.get(last.instance);
+    const crash = chromeCrashBetween(last.at, Date.now());
+    why = crash
+      ? `went when Chrome crashed at ${clock(crash)}, and ${last.profile} hasn't reconnected`
+      : `is out of reach: ${last.profile} ${drop && drop > last.at ? `disconnected at ${clock(drop)}` : "isn't connected"} (Chrome quit or crashed, or that profile's last window closed)`;
+  }
+  if (!why && last && seen.drops.get(last.instance) > last.at) why = `wasn't there when ${last.profile} came back after dropping at ${clock(seen.drops.get(last.instance))}`;
+  // The same page in another tab: a restored copy, or one opened since.
+  let also = '';
+  // Only in the profile it was in: the same address in another profile is
+  // another account's page (a work Gmail and a personal one), and not a copy.
+  const home = last && profiles.get(last.instance);
+  if (last?.url && home) {
+    const tabs = await call(home, 'tabs', {}, 5_000).catch(() => []);
+    const same = tabs.filter((t) => t.tabId !== tabId && bareUrl(t.url) === last.url);
+    if (same.length) {
+      also = ` The same page is open in ${last.profile} in tab ${same.slice(0, 3).map((t) => t.tabId).join(', ')} now. If Chrome restored it, that may be this tab under its new id, but it may be one of the user's: snap it to check, and if it's yours, open the page again rather than claim a tab that may be theirs.`;
+    }
+  }
+  const head = why ? `${what} ${why}.` : `${what} has closed, or isn't in any connected profile.`;
+  return Object.assign(new Error(`${head}${also} browserbear tabs lists what's open`), { closed: true });
+}
 
 // The tab as its profile sees it right now: null if it has gone, undefined if
 // that can't be told (the profile's reconnecting, say).
@@ -477,7 +628,7 @@ async function cdp(tabId, method, params, timeoutMs = CDP_WAIT_MS, frame = null)
     if (/URL of different extension/.test(e.message)) throw new Error(`${describe(p)} is running older BrowserBear extension code, which can't clear another extension's frame out of tab ${tabId}. The page itself is fine; browserbear reload, then try again`);
     // Chrome's "No tab with given id" reads like a BrowserBear bug. What it means
     // is the page closed, usually by itself: a sign-in popup that's finished.
-    if (/no tab with (given )?id/i.test(e.message)) throw Object.assign(new Error(closedMessage(tabId)), { closed: true });
+    if (/no tab with (given )?id/i.test(e.message)) throw await goneError(tabId);
     if (!/Cannot attach to this target/.test(e.message)) throw e;
     throw await refusal(p, tabId);
   }
@@ -592,7 +743,11 @@ const CUT_OFF_WAIT_MS = Number(process.env.BROWSERBEAR_CUT_OFF_WAIT_MS) || 20_00
 async function whileCutOff(tabId, attempt) {
   const s = state(tabId);
   const wait = s.gaveUpAt && Date.now() - s.gaveUpAt < CUT_OFF_WAIT_MS ? 0 : CUT_OFF_WAIT_MS;
-  for (const until = Date.now() + wait; ; ) {
+  // Each try is an attach Chrome cuts off again. Spaced out, so a cut-off
+  // that lasts doesn't mean two attaches a second for as long as it does: on
+  // 19 Nov 2026 Chrome crashed after about 200 of those in three minutes.
+  // Whether they were why isn't known, but they bought nothing.
+  for (let until = Date.now() + wait, pause = 500; ; pause = Math.min(pause * 2, 2_000)) {
     try {
       const result = await attempt();
       s.gaveUpAt = null;
@@ -603,7 +758,7 @@ async function whileCutOff(tabId, attempt) {
         if (wait) s.gaveUpAt = Date.now();
         throw cutOffError(tabId, e);
       }
-      await sleep(500);
+      await sleep(Math.min(pause, Math.max(0, until - Date.now())));
     }
   }
 }
@@ -1237,7 +1392,7 @@ async function lateEffect(tabId) {
 // so the note says what was seen and where to look.
 async function orClosed(tabId, act) {
   await ownerOf(tabId);
-  if ((await tabNow(tabId)) === null) throw new Error(closedMessage(tabId));
+  if ((await tabNow(tabId)) === null) throw await goneError(tabId);
   let sent = false;
   try {
     return await act(() => {
@@ -1245,15 +1400,17 @@ async function orClosed(tabId, act) {
     });
   } catch (e) {
     // Chrome can say the session ended a moment before the tab leaves its list.
-    const looksClosed = /has closed|detached|not attached|target closed|no tab/i.test(e.message);
+    const looksClosed = e.closed || /has closed|detached|not attached|target closed|no tab/i.test(e.message);
     for (let i = looksClosed ? 5 : 1; i > 0; i--) {
       if ((await tabNow(tabId)) === null) {
+        // Worked out before its owner is forgotten below.
+        const gone = sent ? null : await goneError(tabId);
         tabState.delete(tabId);
         marks.closed(tabId);
         tabOwner.delete(tabId);
         bearTabs.delete(tabId);
         sentTo.delete(tabId);
-        if (!sent) throw new Error(closedMessage(tabId));
+        if (gone) throw gone;
         return `(tab ${tabId} closed straight after that, which is what a sign-in popup does when it has finished, so don't retry it. See whether the tab that opened it moved on: browserbear tabs lists what's open)`;
       }
       if (i > 1) await sleep(200);
@@ -2503,6 +2660,7 @@ const remember = (instance, tab) => {
   // Agent-only: one of Mike's tabs with the same id mustn't take it over.
   if (agentOnlyOn() && instance !== AGENT_INSTANCE && tabOwner.get(tab.tabId) === AGENT_INSTANCE) return tab;
   tabOwner.set(tab.tabId, instance);
+  if (agentsTab(tab)) sawTab(instance, tab);
   return tab;
 };
 
@@ -2593,6 +2751,9 @@ const commands = {
   panelState: () => panel.state(),
 
   async profiles() {
+    // Two copies of the extension in one profile (see findTwins).
+    const pairs = [...twins].filter(([a, b]) => a < b && profiles.has(a) && profiles.has(b)).map(([a, b]) => [profiles.get(a), profiles.get(b)]);
+    const withTwins = (list) => [list, ...pairs.map(([a, b]) => `(${describe(a)} has two BrowserBear extensions, ${a.version} and ${b.version}, which each keep their own idea of which tabs are agents'. Remove the older one at chrome://extensions in that profile.)`)].join('\n');
     const connected = [...profiles.values()];
     const known = chromeProfiles();
     if (!known) {
@@ -2601,19 +2762,19 @@ const commands = {
       const names = Array.isArray(menu) ? menu : [];
       learnNames(names);
       const unmatched = names.filter((n) => !connected.some((p) => p.menuName === n));
-      return [
+      return withTwins([
         ...connected.map((p) => `● ${describe(p)}`),
         ...unmatched.map((n) => `○ ${n}`),
         unmatched.length
           ? `(○ is in Chrome's Profiles menu but not matched to a connected profile: BrowserBear only learns a connected profile's email, so it may be one of the ● above. \`--profile "<name>"\` opens it.)`
           : Array.isArray(menu) ? null : `(BrowserBear couldn't read Chrome's Profiles menu: ${menu.error}. \`--profile <email>\` still opens a profile that isn't connected.)`,
         `(${NO_NAMES})`,
-      ].filter(Boolean).join('\n');
+      ].filter(Boolean).join('\n'));
     }
-    return known.map((p) => {
+    return withTwins(known.map((p) => {
       const c = connected.find((x) => x.email && x.email === p.email);
       return `${c ? '●' : '○'} ${p.name} (${p.email || 'not signed in'}, ${p.dir})${c ? '' : ': extension not connected'}`;
-    }).join('\n');
+    }).join('\n'));
   },
 
   async tabs({ profile }) {
@@ -2644,6 +2805,7 @@ const commands = {
     panel.remember(tab.tabId, thread, p.instance, true);
     marks.used(tab.tabId, thread, `opening ${hostOf(url)}`);
     bearTabs.add(tab.tabId);
+    sawTab(p.instance, tab);
     sent(tab.tabId, url);
     // The agent still needs the tab's id to get out of a page that failed.
     const failure = loadFailure(tab);
@@ -3016,7 +3178,7 @@ const commands = {
     try {
       tabs = await call(await ownerOf(tab), 'tabs');
     } catch (e) {
-      return /^no tab /.test(e.message) ? { gone: true } : { unknown: true };
+      return e.closed || /^no tab /.test(e.message) ? { gone: true } : { unknown: true };
     }
     const t = tabs.find((x) => x.tabId === tab);
     if (!t) {
@@ -3094,6 +3256,44 @@ const commands = {
     return `let go of tab ${tab}; its marks are off`;
   },
 };
+
+// Two BrowserBear extensions in one Chrome profile (the Web Store's 0.3.8 next
+// to the unpacked one in mike@gangbusters.io, 19 Nov 2026) both say hello and
+// both answer for the same tabs. Each keeps its own BrowserBear window, so
+// which tabs are agents' depends on which copy is asked, and moving tabs
+// between them broke more than it fixed (two reviews' worth). So they're only
+// found and named, for the user to remove one: tab ids are shared across a
+// whole Chrome, so two hosts that list the same ones are in the same profile.
+// instance -> the other copy's instance, both ways.
+const twins = new Map();
+const versionOf = (v) => String(v || '').split('.').map((n) => Number(n));
+function newer(a, b) {
+  const [x, y] = [versionOf(a.version), versionOf(b.version)];
+  if (x.some(isNaN) || y.some(isNaN)) return null;
+  for (let i = 0; i < Math.max(x.length, y.length); i++) if ((x[i] || 0) !== (y[i] || 0)) return (x[i] || 0) > (y[i] || 0) ? a : b;
+  return null;
+}
+async function findTwins(p) {
+  if (!p.email || p.instance === AGENT_INSTANCE) return;
+  const others = [...profiles.values()].filter((q) => q !== p && q.email === p.email && q.instance !== AGENT_INSTANCE);
+  if (!others.length) return;
+  const ids = (q) => call(q, 'tabs', {}, 5_000).then((tabs) => new Set(tabs.map((t) => t.tabId)), () => null);
+  const mine = await ids(p);
+  for (const q of others) {
+    const theirs = await ids(q);
+    if (!mine?.size || !theirs || ![...mine].some((id) => theirs.has(id))) continue;
+    twins.set(p.instance, q.instance);
+    twins.set(q.instance, p.instance);
+    log(`two BrowserBear extensions in ${describe(p)}: ${p.version} and ${q.version}`);
+  }
+}
+
+// --profile <email> with both copies of a pair connected: the newer one, as
+// it's the one new tabs should get. Anything else is still ambiguous.
+function twinPick(hits) {
+  if (hits.length !== 2 || twins.get(hits[0].instance) !== hits[1].instance) return null;
+  return newer(hits[0], hits[1]) || hits[0];
+}
 
 function onHostMessage(profile, msg) {
   if (profiles.get(profile.instance) !== profile) return; // a replaced host's late reply/event
@@ -3367,9 +3567,10 @@ const server = net.createServer((conn) => {
           old.pending.clear();
           old.conn.destroy();
         }
-        profile = { instance: msg.instance, email: msg.email, name: msg.name || known.name || menuNames.get(msg.email), menuName: menuNames.get(msg.email), dir: known.dir, browser: msg.browser, conn, pending: new Map() };
+        profile = { instance: msg.instance, email: msg.email, name: msg.name || known.name || menuNames.get(msg.email), menuName: menuNames.get(msg.email), dir: known.dir, browser: msg.browser, version: msg.version, conn, pending: new Map() };
         profiles.set(msg.instance, profile);
         log('hello from', describe(profile), msg.version);
+        findTwins(profile).catch((e) => log('cannot compare twins:', e.message));
         marks.resend();
         // The name agents will find this profile by, for the setup page.
         // Older extensions answer it with an "unknown op" error that has no
@@ -3391,6 +3592,10 @@ const server = net.createServer((conn) => {
         w.reject(new Error(`${describe(profile)} disconnected`));
       }
       profiles.delete(profile.instance);
+      twins.delete(twins.get(profile.instance));
+      twins.delete(profile.instance);
+      seen.drops.set(profile.instance, Date.now());
+      saveSeen(true);
       log('gone', describe(profile));
     }
   });

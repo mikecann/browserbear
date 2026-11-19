@@ -62,6 +62,18 @@ browserbear CLI (or Threadbear)
   answers, and `read` waits for a page with a body. A button that seems to have done
   nothing gets a few seconds more before that's reported, and a tab that closes itself
   (a sign-in popup finishing) is reported as that, not as a failure or "(no change)".
+- `open` starts the tab on about:blank, as a tab you open starts on the New Tab page,
+  so the page can't `window.close()` it: Chrome allows that for a tab with one page in
+  its history, and Zoho Campaigns' Save closed agents' tabs that way. A tab id lasts
+  until Chrome quits, so ids survive the service or extension reconnecting (a command
+  waits up to 10 s for its profile to come back). A tab that has gone is reported with
+  why: closed with `close`, with its window, by the user or its page, or lost when
+  Chrome quit or crashed, along with any tab now open on the same page.
+- Two BrowserBear extensions in one Chrome profile (the Web Store's and an unpacked
+  one) both answer for its tabs, each with its own idea of which are agents'. `profiles`
+  names the pair so the older one can be removed, and `--profile <email>` opens new
+  tabs with the newer one. An attach that finds another debugger on the tab says so,
+  rather than taking it for its own.
 - `type` into a code split across one-character boxes fills the row one character per
   box, leaving out spaces and dashes, and reads it back.
 - `type` reads the field back. If inserted text changed nothing after a couple of

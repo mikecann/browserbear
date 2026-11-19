@@ -106,7 +106,7 @@ test('a click that closes or moves its tab later is not reported as doing nothin
   assert.doesNotMatch(closed, /--script|no change/);
 
   // The retry that hit this says the tab has gone, in words, and doesn't claim to have worked.
-  await assert.rejects(browserbear('click', '1', ref, '--script'), /no tab 1 in any connected profile/);
+  await assert.rejects(browserbear('click', '1', ref, '--script'), /tab 1 has closed, or isn't in any connected profile/);
 
   // Closes as the click lands.
   await openPage();

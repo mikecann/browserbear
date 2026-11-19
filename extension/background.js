@@ -223,18 +223,35 @@ const ops = {
   // it to your bookmarks bar, and syncs it to your other devices. Agents'
   // groups ("poddle", "crypto", two "poddle"s...) piled up there with no
   // extension API to delete them (30 Oct). An old caller's `group` is ignored.
+  //
+  // The tab starts on about:blank and then goes to the page, as one you open
+  // yourself starts on the New Tab page. A page may close a tab with only one
+  // page in its history (window.close(), which Chrome allows for popups), and
+  // Zoho Campaigns' Save did that to agents' tabs on 19 Nov 2026, twice. The
+  // tab was the only one in that profile, so the profile shut down with it.
+  // Only for web and file pages: about: and chrome: pages don't close
+  // themselves, and moving about:blank to about:blank#x never came back.
   async open({ url }) {
+    const viaBlank = /^(https?|file):/i.test(url);
+    const first = viaBlank ? 'about:blank' : url;
     const win = await bearWindow();
     let tab;
     if (win) {
       await ungroupAll(win.id);
-      tab = await chrome.tabs.create({ url, active: true, windowId: win.id });
+      tab = await chrome.tabs.create({ url: first, active: true, windowId: win.id });
     } else {
-      const made = await chrome.windows.create({ url, focused: false, width: 1280, height: 900 });
+      const made = await chrome.windows.create({ url: first, focused: false, width: 1280, height: 900 });
       await chrome.storage.session.set({ bearWindow: made.id });
       tab = made.tabs[0];
     }
-    return tabInfo(await waitForLoad(tab.id));
+    if (!viaBlank) return tabInfo(await waitForLoad(tab.id));
+    // Blank's own load finishes first, so it isn't taken for the page's.
+    await waitForLoad(tab.id, 5_000);
+    // A URL Chrome won't take mustn't leave a blank tab no one has the id of.
+    return ops.navigate({ tabId: tab.id, url }).catch(async (e) => {
+      await chrome.tabs.remove(tab.id).catch(() => {});
+      throw e;
+    });
   },
 
   // Navigates without the debugger, which Chrome won't attach to a tab on one
@@ -273,8 +290,25 @@ const ops = {
 
   async close({ tabId }) {
     await detach(tabId);
-    await chrome.tabs.remove(tabId);
+    closing.add(tabId);
+    await chrome.tabs.remove(tabId).catch((e) => {
+      closing.delete(tabId);
+      throw e;
+    });
     return true;
+  },
+
+  // Why a tab that has gone went, for the service's error to an agent that
+  // still holds its id. Null when it didn't close in this profile this run.
+  async closed({ tabId }) {
+    await gone;
+    return (await chrome.storage.session.get('closedTabs')).closedTabs?.[tabId] ?? null;
+  },
+
+  // When this profile last started (Chrome starting, or the profile opening
+  // again): tab ids from before then mean nothing now.
+  async started() {
+    return (await chrome.storage.local.get('startedAt')).startedAt ?? null;
   },
 
   // For when the agent wants you to do something in a tab (sign in, pay,
@@ -484,6 +518,25 @@ chrome.tabs.onUpdated.addListener(async (tabId, change) => {
   // way (a cast to the Browser panel, a click), put it back out of the way.
   if (showTimers.has(tabId)) await setMarkHidden(tabId, true);
 });
+
+// Tabs that closed this run, and why, as far as Chrome says: the last 100.
+// Chrome doesn't say whether you closed a tab or its page did (window.close()
+// in a popup), only whether its whole window went.
+const closing = new Set(); // tabs the close op is closing
+let gone = Promise.resolve();
+chrome.tabs.onRemoved.addListener((tabId, { isWindowClosing }) => {
+  const why = closing.delete(tabId) ? 'browserbear' : isWindowClosing ? 'window' : 'chrome';
+  gone = gone.then(async () => {
+    const { closedTabs = {} } = await chrome.storage.session.get('closedTabs');
+    closedTabs[tabId] = { at: Date.now(), why };
+    // Oldest first by when they closed: a low id can be a tab that was open a long time.
+    const ids = Object.keys(closedTabs).sort((a, b) => closedTabs[a].at - closedTabs[b].at);
+    for (const id of ids.slice(0, Math.max(0, ids.length - 100))) delete closedTabs[id];
+    await chrome.storage.session.set({ closedTabs });
+  }).catch((e) => console.warn('browserbear: cannot note a closed tab', e));
+});
+
+chrome.runtime.onStartup.addListener(() => chrome.storage.local.set({ startedAt: Date.now() }));
 
 chrome.tabs.onRemoved.addListener(async (tabId) => {
   loadErrors.delete(tabId);
@@ -722,11 +775,13 @@ async function ungroupAll(windowId) {
 }
 
 function waitForLoad(tabId, timeoutMs = 30_000) {
-  return new Promise((resolve) => {
-    const done = async () => {
+  return new Promise((resolve, reject) => {
+    const done = () => {
       clearTimeout(timer);
       chrome.tabs.onUpdated.removeListener(listener);
-      resolve(await chrome.tabs.get(tabId));
+      chrome.tabs.onRemoved.removeListener(removed);
+      // The tab may have closed meanwhile: that's an error, not a hang.
+      chrome.tabs.get(tabId).then(resolve, reject);
     };
     const listener = (id, change) => {
       if (id === tabId && change.status === 'complete') done();
@@ -734,8 +789,11 @@ function waitForLoad(tabId, timeoutMs = 30_000) {
     // A slow page still comes back after the timeout; the agent can look at
     // it and decide, rather than getting an error.
     const timer = setTimeout(done, timeoutMs);
+    // Closed while loading: done looks it up and fails, rather than wait it out.
+    const removed = (id) => id === tabId && done();
     chrome.tabs.onUpdated.addListener(listener);
-    chrome.tabs.get(tabId).then((t) => t.status === 'complete' && done());
+    chrome.tabs.onRemoved.addListener(removed);
+    chrome.tabs.get(tabId).then((t) => t.status === 'complete' && done(), () => done());
   });
 }
 
@@ -755,8 +813,15 @@ async function attach(tabId) {
         throw e;
       });
     } catch (e) {
-      // Already attached by us from before a worker restart is fine.
       if (!String(e?.message).includes('Another debugger is already attached')) throw e;
+      // Fine if it's ours from before a worker restart, which a command shows.
+      // It may be another's: DevTools, or a second copy of BrowserBear in this
+      // profile (the Web Store's next to an unpacked one, 19 Nov 2026), and
+      // then every command would fail as "not attached" while it's counted ours.
+      // Browser-side, so a page stuck in a dialog or a loop still answers.
+      const ours = await chrome.debugger.sendCommand({ tabId }, 'Target.getTargetInfo').then(() => true, () => false);
+      // Worded so the service doesn't take it for Chrome cutting us off, and retry.
+      if (!ours) throw new Error(`another debugger has tab ${tabId} (DevTools open on it, or a second copy of BrowserBear in this profile: browserbear profiles says), so BrowserBear can't get in. The page itself is fine; close DevTools there, or remove the extra BrowserBear at chrome://extensions`);
     }
   }
   clearTimeout(attached.get(tabId));
