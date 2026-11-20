@@ -342,10 +342,10 @@ const ops = {
   // scripting rather than the debugger, which would put Chrome's bar up and
   // clear your password manager's menu while you sign in. Says only yes or no:
   // nothing from the page comes back. Every frame, as sign-ins and card forms
-  // are often in one. A page that can't be scripted gives null, not "no".
+  // are often in one. A page that can't be scripted gives null, not "no", for both.
   async probe({ tabId, text }) {
     const frames = await chrome.scripting.executeScript({ target: { tabId, allFrames: true }, func: probePage, args: [text ?? null] }).catch(() => []);
-    if (!frames.length) return { signInForm: null, text: false };
+    if (!frames.some((f) => f.result != null)) return { signInForm: null, text: null };
     return { signInForm: frames.some((f) => f.result?.signInForm), text: frames.some((f) => f.result?.text) };
   },
 

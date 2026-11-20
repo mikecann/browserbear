@@ -443,12 +443,14 @@ function onEvent(m) {
 }
 
 // What `handoff --wait` asks: is there still a sign-in form, and is this text
-// here? Yes or no only, as with the extension. Main frame only, for now.
+// here? Yes or no only, as with the extension, and text matches the same way
+// (whatever its case or line breaks). Main frame only, for now.
 const PROBE = (text) => `(() => {
   const seen = (e) => { const r = e.getBoundingClientRect(); return r.width > 0 && r.height > 0; };
+  const tidy = (s) => s.replace(/\\s+/g, ' ').trim().toLowerCase();
   const signInForm = [...document.querySelectorAll('input[type=password]')].some(seen);
   const want = ${JSON.stringify(text ?? null)};
-  return { signInForm, text: want ? (document.body?.innerText || '').includes(want) : false };
+  return { signInForm, text: want ? tidy(document.body?.innerText || '').includes(tidy(want)) : false };
 })()`;
 
 const ops = {
@@ -541,7 +543,7 @@ const ops = {
 
   async probe({ tabId, text }) {
     const r = await browserCall('Runtime.evaluate', { expression: PROBE(text), returnByValue: true }, await sessionFor(tabOf(tabId)), 5_000).catch(() => null);
-    return r?.result?.value ?? { signInForm: null, text: false };
+    return r?.result?.value ?? { signInForm: null, text: null };
   },
 
   async cdp({ tabId, method, params, sessionId, timeoutMs }) {

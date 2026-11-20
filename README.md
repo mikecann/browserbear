@@ -234,8 +234,12 @@ on the tab has a Done button for whatever that can't see. When you've finished t
 bar goes green and says "Thanks, carrying on", then fades, and the command prints
 where the tab ended up. If a page's address won't change, or a checkout has several
 steps, the agent says what finished looks like: `--until-url '*console.cloud.google.com/*'`
-or `--until-text "Payment received"`. Exits 0 when you've finished (including if you
-drag the tab back to BrowserBear's window), 2 if you closed the tab and 124 at the
+or `--until-text "Payment received"`, or both, which then must both be true. If
+that's already true in the first few seconds, before you've had a chance to do
+anything, it stops with an error (exit 1) rather than say you've finished: the agent
+asked for the page you start on, not the one you end on. Exits 0 when you've
+finished (including if you drag the tab back to BrowserBear's window), 2 if you
+closed the tab and 124 at the
 timeout (`--timeout <seconds>`, 20 minutes by default). The wait watches the tab's
 address and a yes-or-no question to the page, without attaching a debugger just
 to monitor it.

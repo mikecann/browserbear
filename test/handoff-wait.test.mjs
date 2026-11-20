@@ -4,9 +4,9 @@ import http from 'node:http';
 import path from 'node:path';
 import { spawn } from 'node:child_process';
 import { startBear, root, CFT, extensionInChrome } from './harness.mjs';
-import { createHandoffWatch, looksLikeSignIn, urlMatches } from '../service/handoff-wait.mjs';
+import { createHandoffWatch, looksLikeSignIn, urlMatches, UntilAlreadyMet } from '../service/handoff-wait.mjs';
 
-const look = (url, more = {}) => ({ url, title: 'Page', status: 'complete', signInForm: false, ...more });
+const look = (url, more = {}) => ({ url, title: 'Page', status: 'complete', signInForm: false, text: false, ...more });
 const PWD = 'https://accounts.google.com/v3/signin/challenge/pwd?continue=https://console.cloud.google.com/apis/credentials';
 
 // Feeds looks to a watch at the given times, and returns the first answer with its time.
@@ -86,12 +86,99 @@ test('handed off mid-redirect, the page it lands on is the handoff page', () => 
 test('--until flags replace the guessing', () => {
   const pay = { untilText: 'Payment received' };
   // Leaving the page isn't enough when you've said what finished looks like.
-  assert.equal(play([[0, look('https://a.com/pay')], [9000, look('https://a.com/pay/2')]], pay), null);
-  assert.match(play([[0, look('https://a.com/pay')], [9000, look('https://a.com/pay/2', { text: true })]], pay).why, /Payment received/);
+  assert.equal(play([[0, look('https://a.com/pay')], [3000, look('https://a.com/pay')], [9000, look('https://a.com/pay/2')]], pay), null);
+  assert.match(play([[0, look('https://a.com/pay')], [3000, look('https://a.com/pay')], [9000, look('https://a.com/pay/2', { text: true })]], pay).why, /Payment received/);
   const url = { untilUrl: '*a.com/done*' };
-  assert.equal(play([[0, look('https://a.com/pay')], [9000, look('https://a.com/pay/2')]], url), null);
-  assert.equal(play([[0, look('https://a.com/pay')], [9000, look('https://a.com/done', { status: 'loading' })]], url), null);
-  assert.ok(play([[0, look('https://a.com/pay')], [9000, look('https://a.com/done')]], url));
+  assert.equal(play([[0, look('https://a.com/pay')], [3000, look('https://a.com/pay')], [9000, look('https://a.com/pay/2')]], url), null);
+  assert.equal(play([[0, look('https://a.com/pay')], [3000, look('https://a.com/pay')], [9000, look('https://a.com/done', { status: 'loading' })]], url), null);
+  assert.ok(play([[0, look('https://a.com/pay')], [3000, look('https://a.com/pay')], [9000, look('https://a.com/done')]], url));
+});
+
+test('--until already true where the tab was handed over is an error, not finished', () => {
+  // Scaleway, 20 Nov: handed over on the onboarding page, which --until-url already matched.
+  const ONBOARD = 'https://console.scaleway.com/onboarding?isAccountCreated=yes';
+  const url = { untilUrl: 'https://console.scaleway.com/*' };
+  assert.throws(() => play([[0, look(ONBOARD)]], url), (e) => e instanceof UntilAlreadyMet && /--until-url https:\/\/console\.scaleway\.com\/\* is already true .*onboarding/.test(e.message));
+  // Redirected there by itself in the first few seconds, all the same, once it's loaded.
+  assert.throws(() => play([[0, look('https://a.com/hop', { status: 'loading' })], [1500, look(ONBOARD, { status: 'loading' })], [3000, look(ONBOARD)]], url), UntilAlreadyMet);
+  // Passing through a matching address on the way somewhere else isn't being there.
+  assert.equal(play([[0, look('https://console.scaleway.com/dashboard', { status: 'loading' })], [1500, look('https://login.scaleway.com/')], [4500, look('https://login.scaleway.com/')]], url), null);
+  // Text it has already, or draws a moment after loading.
+  const text = { untilText: 'Dashboard' };
+  assert.throws(() => play([[0, look('https://a.com/app', { text: false })], [1500, look('https://a.com/app', { text: true })]], text), /--until-text "Dashboard" is already true/);
+  // With both, both must be true from the start for it to be an error...
+  const both = { ...url, untilText: 'Dashboard' };
+  assert.throws(() => play([[0, look(ONBOARD, { text: true })]], both), /--until-url .* with --until-text "Dashboard"/);
+  // ...and the text alone then says when they've finished.
+  assert.equal(play([[0, look(ONBOARD)], [3000, look(ONBOARD)], [9000, look(ONBOARD + '&step=2')]], both), null);
+  assert.equal(play([[0, look(ONBOARD)], [3000, look(ONBOARD)], [9000, look('https://console.scaleway.com/dashboard', { text: true })]], both).why, 'the tab reached https://console.scaleway.com/* and "Dashboard" is on the page');
+  // The first look counts as the start even if it comes late (the service was restarting).
+  assert.throws(() => play([[30000, look(ONBOARD)]], url), UntilAlreadyMet);
+  // Done still finishes it, whatever the page.
+  assert.match(play([[0, look(ONBOARD, { doneClicked: true })]], url).why, /clicked Done/);
+});
+
+test('the start lasts until the page has been seen loaded, still and asked', () => {
+  const app = 'https://a.com/app';
+  const text = { untilText: 'Dashboard' };
+  // The probe can't ask the page for the first few seconds, then can: still the start.
+  assert.throws(() => play([[0, look(app, { text: null })], [3000, look(app, { text: null })], [6000, look(app, { text: null })], [7500, look(app, { text: true })]], text), UntilAlreadyMet);
+  // Loading the whole time, then drawing the text: still the start.
+  assert.throws(() => play([[0, look(app, { status: 'loading' })], [6000, look(app, { status: 'loading' })], [7000, look(app)], [8000, look(app, { text: true })]], text), UntilAlreadyMet);
+  // Handed over on a page that failed to load: not an error, and it finishes once it loads.
+  const url = { untilUrl: '*a.com/done*' };
+  const failed = look('https://a.com/done', { loadError: 'net::ERR_CONNECTION_REFUSED' });
+  assert.ok(play([[0, failed], [3000, failed], [9000, failed], [20000, look('https://a.com/done')]], url));
+  // A redirect late in the start settles all over again.
+  const both = { untilUrl: '*/onboarding*', untilText: 'Dashboard' };
+  const hop = look('https://a.com/hop');
+  assert.throws(() => play([[0, hop], [1500, hop], [3000, hop], [4500, look('https://a.com/onboarding', { status: 'loading' })], [6000, look('https://a.com/onboarding', { text: true })]], both), UntilAlreadyMet);
+  // Loading for a while, then drawing the text a moment after it loads: still the start.
+  assert.throws(() => play([[0, look(app, { status: 'loading' })], [1500, look(app, { status: 'loading' })], [3000, look(app, { status: 'loading' })], [4500, look(app, { status: 'loading' })], [6000, look(app)], [7500, look(app, { text: true })]], text), UntilAlreadyMet);
+  // A query change starts the page loading again, however long the path's been there.
+  const stage = { untilUrl: '*stage=done*' };
+  const pay = look('https://a.com/checkout?stage=pay');
+  assert.equal(play([[0, pay], [3000, pay], [20000, look('https://a.com/checkout?stage=done', { status: 'loading' })]], stage), null);
+});
+
+test('--until-url and --until-text together wait for both', () => {
+  const both = { untilUrl: '*a.com/done*', untilText: 'Paid' };
+  assert.equal(play([[0, look('https://a.com/pay')], [3000, look('https://a.com/pay')], [9000, look('https://a.com/done')]], both), null);
+  assert.equal(play([[0, look('https://a.com/pay')], [3000, look('https://a.com/pay')], [9000, look('https://a.com/pay/2', { text: true })]], both), null);
+  // The text being there is enough to go on while the page still loads.
+  assert.equal(
+    play([[0, look('https://a.com/pay')], [3000, look('https://a.com/pay')], [9000, look('https://a.com/done', { text: true, status: 'loading' })]], both).why,
+    'the tab reached *a.com/done* and "Paid" is on the page',
+  );
+  // A query change counts, for an address that says where you are in it.
+  assert.ok(play([[0, look('https://a.com/checkout?stage=pay')], [3000, look('https://a.com/checkout?stage=pay')], [6000, look('https://a.com/checkout?stage=done')]], { untilUrl: '*stage=done*' }));
+});
+
+test('--wait --until-url already true at the start: exits 1 and says why', async (t) => {
+  const { world, run } = await waitingBear(t, 'https://console.scaleway.com/onboarding');
+  world.signInForm = false;
+  const { code, out } = await run('--until-url', 'https://console.scaleway.com/*').done;
+  assert.equal(code, 1);
+  assert.match(out, /browserbear: --until-url https:\/\/console\.scaleway\.com\/\* is already true on the page the tab was handed over on/);
+  assert.doesNotMatch(out, /the user has finished/);
+});
+
+test('--wait: an address and an answer from different pages are no answer', async (t) => {
+  const { world, run, until } = await waitingBear(t, 'https://a.com/start');
+  world.signInForm = false;
+  // In BrowserBear's window the whole time, as every tab in the agents' browser is.
+  world.tab.bear = true;
+  const wait = run('--until-url', '*a.com/done*', '--until-text', 'Paid', '--timeout', '12');
+  await until(() => world.marks.at(-1)?.finish === true);
+  await new Promise((r) => setTimeout(r, 6000));
+  // The tab's on /done (no "Paid") when it's listed, then on /review ("Paid") when asked.
+  world.tab.url = 'https://a.com/done';
+  world.onProbe = () => {
+    world.tab.url = world.tab.url === 'https://a.com/done' ? 'https://a.com/review' : 'https://a.com/done';
+    world.text = world.tab.url === 'https://a.com/review';
+  };
+  const { code, out } = await wait.done;
+  assert.equal(code, 124, out);
 });
 
 test('Done, and being moved back to BrowserBear\'s window, finish it wherever the page is', () => {
@@ -120,7 +207,7 @@ async function waitingBear(t, first, extraEnv) {
       if (op === 'tabs') return world.closed ? [] : [tab];
       if (op === 'handoff') return tab;
       if (op === 'mark') return world.marks.push(args.mark), true;
-      if (op === 'probe') return { signInForm: world.signInForm, text: world.text };
+      if (op === 'probe') return world.onProbe?.(), { signInForm: world.signInForm, text: world.text };
       if (op === 'cdp') world.debugger++;
       throw new Error(`unexpected op ${op}`);
     },
@@ -233,7 +320,7 @@ test('the real extension answers the question without a debugger, and draws the 
   assert.deepEqual(await inWorker(`ops.probe({ tabId: ${hidden} })`), { signInForm: false, text: false });
   // Nothing can script this page: that's "couldn't ask", not "no form".
   const blocked = await inWorker(`chrome.tabs.create({ url: 'chrome://version' }).then((t) => t.id)`);
-  assert.deepEqual(await inWorker(`ops.probe({ tabId: ${blocked} })`), { signInForm: null, text: false });
+  assert.deepEqual(await inWorker(`ops.probe({ tabId: ${blocked} })`), { signInForm: null, text: null });
   // The window it opened in is BrowserBear's, and the tab says so.
   const listed = await inWorker(`ops.tabs().then((tabs) => tabs.find((t) => t.tabId === ${form}))`);
   assert.equal(listed.bear, true);

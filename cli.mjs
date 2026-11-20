@@ -80,8 +80,12 @@ const USAGE = `browserbear: let agents use your real Chrome profiles
                                                 that isn't a sign-in, or they clicked Done in the panel or tab, or
                                                 moved it back to BrowserBear's window. For a page whose address
                                                 won't change, or a checkout with several steps, say what finished
-                                                looks like: --until-url (* is a wildcard) or --until-text.
-                                                Exits 0 when finished, 2 if they closed the tab, 124 at the timeout
+                                                looks like: --until-url (* is a wildcard), --until-text, or both,
+                                                which then must both be true (that address with that text on it).
+                                                Match the page they end on, not the one they start on: if it's
+                                                already true in the first few seconds, it stops with an error.
+                                                Exits 0 when finished, 1 if --until was already true at the start,
+                                                2 if they closed the tab, 124 at the timeout
                                                 (default 20 minutes; run it again to keep waiting).
   browserbear close <tab> [--user-tab]          only closes a tab an agent opened, unless --user-tab
   browserbear release <tab>                     take BrowserBear's marks off a tab and let go of it
@@ -350,10 +354,10 @@ if (cmd === 'agent-only') {
   process.exitCode = cmd && cmd !== 'help' ? 1 : 0;
 } else {
   try {
-    if (cmd === 'handoff' && (flags.wait || flags['until-url'] || flags['until-text'])) {
+    if (cmd === 'handoff' && (flags.wait || flags['until-url'] !== undefined || flags['until-text'] !== undefined)) {
       const timeoutS = flags.timeout === undefined ? DEFAULT_WAIT_S : Number(flags.timeout);
       if (!(timeoutS > 0)) throw new Error(`--timeout takes a number of seconds, not ${flags.timeout}`);
-      for (const f of ['until-url', 'until-text']) if (flags[f] === true) throw new Error(`--${f} needs a value`);
+      for (const f of ['until-url', 'until-text']) if (flags[f] === true || flags[f]?.trim() === '') throw new Error(`--${f} needs a value`);
       process.exitCode = await handoffAndWait({ tab: args.tab, untilUrl: flags['until-url'], untilText: flags['until-text'], timeoutS });
     } else {
       // Which Threadbear thread is asking, so the tabs it uses carry its name

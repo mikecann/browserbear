@@ -3191,6 +3191,15 @@ const commands = {
     if (t.bear) bearTabs.add(tab);
     const seen = await call(await ownerOf(tab), 'probe', { tabId: tab, text }).catch((e) => (/unknown op/.test(e.message) ? { old: true } : {}));
     if (seen.old && text) return { textUnsupported: true };
+    const doneClicked = marks.doneClicked(tab);
+    // For --until-text, the page may have moved on between listing the tab and
+    // asking it: then the address and the answer could be from different
+    // pages, so this look says nothing. Done doesn't care.
+    if (text && !doneClicked) {
+      const after = await call(await ownerOf(tab), 'tabs').then((all) => all.find((x) => x.tabId === tab)).catch(() => null);
+      if (!after || after.url !== t.url) return { unknown: true };
+      Object.assign(t, { status: after.status, loadError: after.loadError });
+    }
     return {
       url: t.url,
       title: t.title,
@@ -3199,7 +3208,7 @@ const commands = {
       bear: t.bear,
       signInForm: seen.signInForm,
       text: seen.text,
-      doneClicked: marks.doneClicked(tab),
+      doneClicked,
     };
   },
 
