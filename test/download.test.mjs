@@ -112,3 +112,54 @@ test('download falls back to a fetch in the page, with relative links', { skip: 
 
   await assert.rejects(browserbear('download', '1', '/missing'), /HTTP 404/);
 });
+
+test('download gets past Drive\'s "can\'t scan this file for viruses" page', async (t) => {
+  const video = Buffer.from('not really an mp4, but bytes all the same');
+  const warning = Buffer.from(`<!DOCTYPE html><html><body><div>Google Drive can't scan this file for viruses.</div>
+    <form id="download-form" action="https://drive.usercontent.google.com/download" method="get">
+      <input type="submit" id="uc-download-link" value="Download anyway">
+      <input type="hidden" name="id" value="ID1"><input type="hidden" name="export" value="download">
+      <input type="hidden" name="authuser" value="0"><input type="hidden" name="confirm" value="t">
+      <input type="hidden" name="uuid" value="u-1"><input type="hidden" name="at" value="A&amp;B:1">
+    </form></body></html>`);
+  const fetched = [];
+  const { browserbear } = await startBear(t, ({ op, args }) => {
+    if (op === 'tabs') return [{ tabId: 1, url: 'https://drive.google.com/', title: 'Drive', active: true }];
+    if (op === 'fetchFile') {
+      fetched.push(args.url);
+      const u = new URL(args.url);
+      if (u.hostname === 'evil.example' || u.searchParams.has('confirm')) return { id: 'v', size: video.length, type: 'video/mp4', disposition: 'attachment; filename="clip.mp4"', url: args.url };
+      return { id: 'w', size: warning.length, type: 'text/html; charset=utf-8', disposition: null, url: args.url };
+    }
+    if (op === 'fetchChunk') return (args.id === 'v' ? video : warning).subarray(args.offset, args.offset + args.length).toString('base64');
+    throw new Error(`unknown op ${op}`);
+  });
+
+  const out = JSON.parse(await browserbear('download', '1', 'https://drive.usercontent.google.com/download?id=ID1&export=download&authuser=0', 'clip.mp4'));
+  assert.equal(out.type, 'video/mp4');
+  assert.ok(fs.readFileSync(out.path).equals(video));
+  assert.equal(fetched.length, 2);
+  const next = new URL(fetched[1]);
+  assert.equal(next.origin + next.pathname, 'https://drive.usercontent.google.com/download');
+  assert.deepEqual(Object.fromEntries(next.searchParams), { id: 'ID1', export: 'download', authuser: '0', confirm: 't', uuid: 'u-1', at: 'A&B:1' });
+});
+
+test('download leaves HTML alone off Drive, or when the form points elsewhere', async (t) => {
+  const page = (action) => Buffer.from(`<form id="download-form" action="${action}" method="get"><input type="hidden" name="confirm" value="t"></form>`);
+  const pages = { 'https://example.com/x': page('https://drive.usercontent.google.com/download'), 'https://drive.usercontent.google.com/download?id=2': page('https://evil.example/steal') };
+  const fetched = [];
+  const { browserbear } = await startBear(t, ({ op, args }) => {
+    if (op === 'tabs') return [{ tabId: 1, url: 'https://drive.google.com/', title: 'Drive', active: true }];
+    if (op === 'fetchFile') {
+      fetched.push(args.url);
+      return { id: args.url, size: pages[args.url].length, type: 'text/html', disposition: null, url: args.url };
+    }
+    if (op === 'fetchChunk') return pages[args.id].subarray(args.offset, args.offset + args.length).toString('base64');
+    throw new Error(`unknown op ${op}`);
+  });
+  for (const url of Object.keys(pages)) {
+    const out = JSON.parse(await browserbear('download', '1', url, 'page.html'));
+    assert.ok(fs.readFileSync(out.path).equals(pages[url]));
+  }
+  assert.deepEqual(fetched, Object.keys(pages));
+});

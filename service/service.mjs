@@ -2543,6 +2543,62 @@ async function fetchInPage(run, url) {
   return { ...f, chunk };
 }
 
+const DRIVE_HOSTS = new Set(['drive.usercontent.google.com', 'drive.google.com']);
+const isDrive = (u) => {
+  try {
+    const x = new URL(u);
+    return x.protocol === 'https:' && DRIVE_HOSTS.has(x.hostname);
+  } catch {
+    return false;
+  }
+};
+
+// A small HTML answer from Drive: read in, so its form can be looked at. The
+// bytes are kept, as the fetch's own are gone once read.
+async function driveScanPage(got, url) {
+  if (!/^text\/html/i.test(got.type || '') || got.size > 512 * 1024 || !isDrive(got.url || url)) return null;
+  const parts = [];
+  for (let offset = 0; offset < got.size; offset += DOWNLOAD_CHUNK) parts.push(Buffer.from(await got.chunk(offset, DOWNLOAD_CHUNK), 'base64'));
+  const bytes = Buffer.concat(parts);
+  return { bytes, html: bytes.toString('utf8') };
+}
+
+// Drive's "can't scan this file for viruses" page: <form id="download-form"
+// action=... method="get"> with hidden inputs (id, export, confirm, uuid, at).
+// Returns the URL its Download anyway button would GET, only ever on Drive.
+function driveScanForm(html, base) {
+  const form = html.match(/<form\b[^>]*\bid=["']download-form["'][^>]*>([\s\S]*?)<\/form>/i);
+  if (!form) return null;
+  const attr = (tag, name) => {
+    const m = tag.match(new RegExp(`\\b${name}\\s*=\\s*(?:"([^"]*)"|'([^']*)')`, 'i'));
+    return m ? decodeEntities(m[1] ?? m[2]) : null;
+  };
+  const open = form[0].slice(0, form[0].indexOf('>') + 1);
+  let target;
+  try {
+    target = new URL(attr(open, 'action') || '', base);
+  } catch {
+    return null;
+  }
+  if (!isDrive(target.href) || (attr(open, 'method') || 'get').toLowerCase() !== 'get') return null;
+  const query = new URLSearchParams();
+  for (const input of form[1].match(/<input\b[^>]*>/gi) || []) {
+    const name = attr(input, 'name');
+    if (name && (attr(input, 'type') || '').toLowerCase() === 'hidden') query.append(name, attr(input, 'value') ?? '');
+  }
+  if (!query.has('confirm')) return null;
+  target.search = query.toString();
+  return target.href;
+}
+
+function decodeEntities(s) {
+  return s.replace(/&(#x[0-9a-f]+|#\d+|amp|lt|gt|quot|apos|#39);/gi, (all, e) => {
+    const k = e.toLowerCase();
+    if (k[0] === '#') return String.fromCodePoint(k[1] === 'x' ? parseInt(k.slice(2), 16) : parseInt(k.slice(1), 10));
+    return { amp: '&', lt: '<', gt: '>', quot: '"', apos: "'" }[k] ?? all;
+  });
+}
+
 // The name the agent gave, else the server's (Content-Disposition), else the
 // URL's last part. Only ever a bare name, so it can't climb out of the folder.
 function fileNameFor(given, disposition, url) {
@@ -3096,16 +3152,30 @@ const commands = {
     const isolated = async () => (run ||= await isolatedIn(tab));
     // A relative link is relative to the page it's on.
     if (!/^[a-z][a-z0-9+.-]*:/i.test(url)) url = await (await isolated())(`new URL(${JSON.stringify(url)}, document.baseURI).href`);
-    let got;
-    try {
-      const f = await call(p, 'fetchFile', { url }, 130_000);
-      got = { ...f, chunk: (offset, length) => call(p, 'fetchChunk', { id: f.id, offset, length }, 60_000) };
-    } catch (e) {
-      // The agents' browser has no fetchFile, nor has an extension that
-      // hasn't reloaded since it came in: fetch from inside the page instead,
-      // which has the page's cookies but not a way round CORS.
-      if (!/unknown op fetchFile/.test(e.message)) throw e;
-      got = await fetchInPage(await isolated(), url);
+    let inPage = false;
+    const fetchIt = async (u) => {
+      if (!inPage) {
+        try {
+          const f = await call(p, 'fetchFile', { url: u }, 130_000);
+          return { ...f, chunk: (offset, length) => call(p, 'fetchChunk', { id: f.id, offset, length }, 60_000) };
+        } catch (e) {
+          // The agents' browser has no fetchFile, nor has an extension that
+          // hasn't reloaded since it came in: fetch from inside the page instead,
+          // which has the page's cookies but not a way round CORS.
+          if (!/unknown op fetchFile/.test(e.message)) throw e;
+          inPage = true;
+        }
+      }
+      return fetchInPage(await isolated(), u);
+    };
+    let got = await fetchIt(url);
+    // Drive answers a file too big to virus-scan with a page saying so, not
+    // the file; its form's GET (with a confirm token) is what gets the file.
+    const page = await driveScanPage(got, url);
+    if (page) {
+      const next = driveScanForm(page.html, got.url || url);
+      if (next) got = await fetchIt(next);
+      else got = { ...got, chunk: async (offset, length) => page.bytes.subarray(offset, offset + length).toString('base64') };
     }
     const name = fileNameFor(filename, got.disposition, got.url || url);
     // A folder of its own each time, so two downloads of one name can't meet.
