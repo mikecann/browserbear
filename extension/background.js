@@ -437,11 +437,16 @@ const ops = {
   // Draws (or, with no mark, takes off) the marks on an agent's tab; the
   // service decides what they say (service/marks.mjs).
   async mark({ tabId, mark }) {
+    const gen = (markGen.get(tabId) || 0) + 1;
+    markGen.set(tabId, gen);
     await chrome.tabs.get(tabId); // "No tab with id" tells the service it's gone
+    if (markGen.get(tabId) !== gen) return true;
     const all = await markStore();
+    if (markGen.get(tabId) !== gen) return true;
     if (mark) all[tabId] = mark;
     else delete all[tabId];
     await chrome.storage.session.set({ marks: all });
+    if (markGen.get(tabId) !== gen) return true;
     await paint(tabId, mark);
     return true;
   },
@@ -502,10 +507,45 @@ async function markStore() {
   return marks;
 }
 
-async function paint(tabId, mark) {
-  const icon = mark ? await badgedIcon(tabId, mark.state).catch(() => null) : null;
-  // Pages extensions can't script (the Web Store, chrome://) go unmarked.
-  await chrome.scripting.executeScript({ target: { tabId }, func: drawMark, args: [mark, icon] }).catch(() => {});
+const markGen = new Map(); // tabId -> latest ops.mark generation
+const paintState = new Map(); // tabId -> { gen, running, next, abort }
+
+// Serialize paints per tab and drop stale generations: a slow favicon fetch
+// must not redraw a mark after release/navigation, and retries on a wedged tab
+// coalesce into one pending job instead of piling up executeScript calls.
+function paint(tabId, mark) {
+  let s = paintState.get(tabId);
+  if (!s) paintState.set(tabId, (s = { gen: 0, running: null, next: null, abort: null }));
+  const gen = ++s.gen;
+  s.next = { mark, gen };
+  s.abort?.abort();
+  if (!s.running) {
+    s.running = (async () => {
+      try {
+        while (s.next) {
+          const job = s.next;
+          s.next = null;
+          let icon = null;
+          if (job.mark) {
+            const ac = new AbortController();
+            s.abort = ac;
+            try {
+              icon = await badgedIcon(tabId, job.mark.state, ac.signal).catch(() => null);
+            } finally {
+              if (s.abort === ac) s.abort = null;
+            }
+          }
+          if (s.gen !== job.gen) continue;
+          // Pages extensions can't script (the Web Store, chrome://) go unmarked.
+          await chrome.scripting.executeScript({ target: { tabId }, func: drawMark, args: [job.mark, icon] }).catch(() => {});
+        }
+      } finally {
+        s.running = null;
+        if (!s.next && paintState.get(tabId) === s) paintState.delete(tabId);
+      }
+    })();
+  }
+  return s.running;
 }
 
 // A page that navigates loses what was drawn on it.
@@ -540,6 +580,9 @@ chrome.runtime.onStartup.addListener(() => chrome.storage.local.set({ startedAt:
 
 chrome.tabs.onRemoved.addListener(async (tabId) => {
   loadErrors.delete(tabId);
+  markGen.delete(tabId);
+  const ps = paintState.get(tabId);
+  if (ps) { ps.gen++; ps.next = null; ps.abort?.abort(); paintState.delete(tabId); }
   const all = await markStore();
   if (!(tabId in all)) return;
   delete all[tabId];
@@ -600,15 +643,18 @@ function setMarkHidden(tabId, hidden) {
 // here rather than in the page, where another site's icon can't be drawn
 // onto a canvas and read back.
 const icons = new Map(); // "href|state" -> data URL
-async function badgedIcon(tabId, state) {
+async function badgedIcon(tabId, state, signal) {
   const [{ result: href } = {}] = await chrome.scripting.executeScript({ target: { tabId }, func: siteIcon });
+  if (signal?.aborted) return null;
   const key = `${href}|${state}`;
   if (icons.has(key)) return icons.get(key);
   let bitmap = null;
   try {
-    const res = await fetch(href);
+    const fetchSignal = signal ? AbortSignal.any([signal, AbortSignal.timeout(3_000)]) : AbortSignal.timeout(3_000);
+    const res = await fetch(href, { signal: fetchSignal });
     if (res.ok) bitmap = await createImageBitmap(await res.blob());
-  } catch {} // no icon, or an SVG, which a worker can't decode
+  } catch {} // no icon, timed out, or an SVG, which a worker can't decode
+  if (signal?.aborted) return null;
   bitmap ||= await createImageBitmap(await (await fetch(chrome.runtime.getURL('icons/icon-32.png'))).blob());
   const canvas = new OffscreenCanvas(32, 32);
   const g = canvas.getContext('2d');
@@ -625,6 +671,7 @@ async function badgedIcon(tabId, state) {
   let bin = '';
   for (const b of bytes) bin += String.fromCharCode(b);
   const url = `data:image/png;base64,${btoa(bin)}`;
+  if (icons.size >= 200) icons.delete(icons.keys().next().value);
   icons.set(key, url);
   return url;
 }
@@ -653,14 +700,31 @@ function siteIcon() {
 // own, and with no mark puts everything back.
 function drawMark(mark, icon) {
   const PREFIX = /^🐻 [^·]{1,40} · /;
+  // Coalesce rapid <head> edits (React/Next.js reconciliation) into one pass,
+  // and yield any channel a reactive page keeps reverting (cubic.dev, 27 Nov
+  // 2026: fighting <head> in a MutationObserver microtask flooded Chrome's
+  // browser process with title/favicon IPCs until PartitionAlloc OOM'd).
+  const ENFORCE_DELAY_MS = 100;
+  const FIGHT_WINDOW_MS = 2_000;
+  const FIGHT_LIMIT = 5;
+
   let m = window.__browserbearMark;
   if (!m && !mark) return;
   if (!m) {
     // Leftovers from before the extension reloaded, whose scripts can't be
     // reached any more (and stop themselves: see enforce).
     document.querySelectorAll('browserbear-mark, link[data-browserbear]').forEach((el) => el.remove());
-    m = window.__browserbearMark = { siteTitle: document.title.replace(PREFIX, ''), saved: [], hidden: false };
-    for (const l of document.querySelectorAll('link[rel="browserbear-icon"]')) m.saved.push([l, 'icon']);
+    m = window.__browserbearMark = {
+      siteTitle: document.title.replace(PREFIX, ''),
+      saved: new Map(),
+      hidden: false,
+      timer: 0,
+      hits: { title: [], icon: [], host: [] },
+      titleYielded: false,
+      iconYielded: false,
+      hostYielded: false,
+    };
+    for (const l of document.querySelectorAll('link[rel="browserbear-icon"]')) m.saved.set(l, 'icon');
 
     m.host = document.createElement('browserbear-mark');
     // Out of the accessibility tree, so agents' snapshots don't see it.
@@ -702,44 +766,135 @@ function drawMark(mark, icon) {
       m.hidden = hidden;
       m.host.style.display = hidden ? 'none' : '';
     };
+
+    const hasPrefix = (t) => PREFIX.test(t) || (!!m.mark && t.startsWith(`🐻 ${m.mark.name} · `));
+
+    m.restoreIcons = () => {
+      m.iconLink?.remove();
+      m.iconLink = null;
+      for (const [l, rel] of m.saved) {
+        if (l.isConnected && l.rel === 'browserbear-icon') l.rel = rel;
+      }
+      m.saved.clear();
+      for (const l of document.querySelectorAll('link[rel="browserbear-icon"]')) l.rel = 'icon';
+    };
+
+    m.stop = () => {
+      clearTimeout(m.timer);
+      m.timer = 0;
+      m.observer.disconnect();
+    };
+
+    m.observe = () => {
+      if (!m.mark || !chrome.runtime?.id) return;
+      const watchHead = !m.titleYielded || !m.iconYielded;
+      if (!m.hostYielded || watchHead) {
+        m.observer.observe(document.documentElement, { childList: true });
+      }
+      if (watchHead && document.head) {
+        m.observer.observe(document.head, { childList: true, subtree: true, characterData: true, attributes: true, attributeFilter: ['rel', 'href'] });
+      }
+    };
+
+    const fighting = (channel) => {
+      const now = Date.now();
+      const recent = m.hits[channel].filter((t) => now - t < FIGHT_WINDOW_MS);
+      recent.push(now);
+      m.hits[channel] = recent;
+      return recent.length >= FIGHT_LIMIT;
+    };
+
     // Sites change their title and icon (Gmail's unread count): the page's
-    // new one is kept for later and ours put back.
-    m.enforce = () => {
+    // new one is kept for later and ours put back. Disconnected around our own
+    // edits so they never re-trigger us, and any channel a reactive page keeps
+    // reverting yields rather than looping.
+    m.enforce = (fromObserver = false) => {
       // A script from before the extension reloaded: it can't reach the
       // extension any more, so it bows out rather than fight the new one.
-      if (!chrome.runtime?.id) return m.observer.disconnect();
-      if (!m.mark) return;
-      if (!PREFIX.test(document.title)) m.siteTitle = document.title;
-      const title = `🐻 ${m.mark.name} · ${m.siteTitle}`;
-      if (document.title !== title) document.title = title;
-      for (const l of document.querySelectorAll('link[rel~="icon" i]:not([data-browserbear])')) {
-        m.saved.push([l, l.rel]);
-        m.siteIcon = l.href;
-        l.rel = 'browserbear-icon';
+      if (!chrome.runtime?.id || !m.mark) return m.stop();
+      m.observer.disconnect();
+      try {
+        if (!m.titleYielded) {
+          if (!hasPrefix(document.title)) m.siteTitle = document.title;
+          const title = `🐻 ${m.mark.name} · ${m.siteTitle}`;
+          if (document.title !== title) {
+            if (fromObserver && fighting('title')) {
+              m.titleYielded = true;
+              if (hasPrefix(document.title)) document.title = m.siteTitle;
+            } else {
+              document.title = title;
+            }
+          }
+        }
+
+        if (!m.iconYielded) {
+          for (const l of m.saved.keys()) if (!l.isConnected) m.saved.delete(l);
+          if (!m.icon) {
+            if (m.iconLink || m.saved.size) m.restoreIcons();
+          } else {
+            const pageIcons = document.querySelectorAll('link[rel~="icon" i]:not([data-browserbear])');
+            const linkDrifted = !m.iconLink?.isConnected || m.iconLink.getAttribute('rel') !== 'icon' || m.iconLink.getAttribute('href') !== m.icon;
+            const needIcon = pageIcons.length > 0 || linkDrifted;
+            if (needIcon) {
+              if (fromObserver && fighting('icon')) {
+                m.iconYielded = true;
+                m.restoreIcons();
+              } else {
+                for (const l of pageIcons) {
+                  if (!m.saved.has(l)) m.saved.set(l, l.rel);
+                  m.siteIcon = l.href;
+                  l.rel = 'browserbear-icon';
+                }
+                if (linkDrifted) {
+                  if (m.iconLink?.isConnected && m.iconLink.href && m.iconLink.getAttribute('href') !== m.icon) m.siteIcon = m.iconLink.href;
+                  m.iconLink?.remove();
+                  m.iconLink = Object.assign(document.createElement('link'), { rel: 'icon', href: m.icon });
+                  m.iconLink.dataset.browserbear = '';
+                  (document.head || document.documentElement).append(m.iconLink);
+                }
+              }
+            }
+          }
+        }
+
+        if (!m.hostYielded && !m.host.isConnected) {
+          if (fromObserver && fighting('host')) {
+            m.hostYielded = true;
+          } else {
+            document.documentElement.append(m.host);
+          }
+        }
+      } finally {
+        m.observe();
       }
-      if (m.icon && !m.iconLink?.isConnected) {
-        m.iconLink = Object.assign(document.createElement('link'), { rel: 'icon', href: m.icon });
-        m.iconLink.dataset.browserbear = '';
-        (document.head || document.documentElement).append(m.iconLink);
-      }
-      if (!m.host.isConnected) document.documentElement.append(m.host);
     };
-    m.observer = new MutationObserver(() => m.enforce());
+
+    m.schedule = () => {
+      if (!chrome.runtime?.id || !m.mark) return m.stop();
+      if (m.timer) return;
+      m.timer = setTimeout(() => {
+        m.timer = 0;
+        m.enforce(true);
+      }, ENFORCE_DELAY_MS);
+    };
+    m.observer = new MutationObserver(() => m.schedule());
   }
 
   if (!mark) {
-    m.observer.disconnect();
+    m.stop();
+    const hadPrefix = PREFIX.test(document.title) || (!!m.mark && document.title.startsWith(`🐻 ${m.mark.name} · `));
+    m.mark = null;
     m.host.remove();
-    m.iconLink?.remove();
-    for (const [l, rel] of m.saved) l.rel = rel;
-    if (PREFIX.test(document.title)) document.title = m.siteTitle;
+    m.restoreIcons();
+    if (hadPrefix) document.title = m.siteTitle;
     delete window.__browserbearMark;
     return;
   }
 
+  m.stop();
   m.mark = mark;
   m.icon = icon;
-  if (m.iconLink && m.iconLink.href !== icon) {
+  if (m.iconLink && m.iconLink.getAttribute('href') !== icon) {
     m.iconLink.remove();
     m.iconLink = null;
   }
@@ -755,10 +910,7 @@ function drawMark(mark, icon) {
   p.done.style.display = mark.finish ? '' : 'none';
   // The glow only while it's busy or waiting on you; an idle tab just keeps the small pill.
   p.glow.style.boxShadow = mark.state === 'idle' ? 'none' : `inset 0 0 0 3px ${colour}, inset 0 0 24px ${colour}55`;
-  m.observer.disconnect();
-  m.enforce();
-  m.observer.observe(document.documentElement, { childList: true });
-  if (document.head) m.observer.observe(document.head, { childList: true, subtree: true, characterData: true, attributes: true, attributeFilter: ['rel', 'href'] });
+  m.enforce(false);
 }
 
 async function bearWindow() {

@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
 import { startBear } from './harness.mjs';
+import { createMarks } from '../service/marks.mjs';
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
@@ -67,4 +68,155 @@ test("an agent's tab carries its thread's name and state until the thread is don
   thread({ status: 'idle', needs: 'nothing' });
   await latest((m) => m === null);
   assert.doesNotMatch(await browserbear('tabs'), /🐻/);
+});
+
+test("createMarks coalesces in-flight sends and backs off when mark times out", async (t) => {
+  const prevTb = process.env.BROWSERBEAR_TB;
+  process.env.BROWSERBEAR_TB = "";
+  t.after(() => {
+    if (prevTb === undefined) delete process.env.BROWSERBEAR_TB;
+    else process.env.BROWSERBEAR_TB = prevTb;
+  });
+  let active = 0;
+  let maxActive = 0;
+  let calls = 0;
+  let fail = true;
+  let lastMark = null;
+  const marks = createMarks({
+    tickMs: 50,
+    log: () => {},
+    send: async (_tabId, mark) => {
+      active++;
+      maxActive = Math.max(maxActive, active);
+      calls++;
+      await sleep(80); // slower than tickMs so ticks would overlap without a guard
+      active--;
+      if (fail) throw new Error("mark timed out after 5s");
+      lastMark = mark;
+    },
+  });
+  t.after(() => marks.close());
+
+  // Rapid overlapping updates must never run two sends concurrently for the same tab.
+  marks.begin(7, null, "opening cubic.dev");
+  marks.begin(7, null, "looking at the page");
+  marks.end(7);
+  marks.end(7);
+  await sleep(450);
+
+  assert.equal(maxActive, 1, "at most one mark RPC in flight per tab");
+  // With 80ms sends and exponential backoff (50ms, 100ms, 200ms...), calls stay low.
+  assert.ok(calls >= 2 && calls <= 4, `expected backed-off retries, got ${calls}`);
+
+  // Once the tab recovers and resend() resets backoff, the mark lands cleanly.
+  fail = false;
+  marks.resend();
+  await sleep(250);
+  assert.equal(lastMark?.action, "looking at the page");
+});
+
+test("createMarks.stop(tabId) still interrupts the thread and does not kill periodic ticks", async (t) => {
+  const dir = fs.mkdtempSync(path.join("/tmp", "bb-tb-stop-"));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const logFile = path.join(dir, "calls.log");
+  const tb = path.join(dir, "tb");
+  fs.writeFileSync(
+    tb,
+    `#!/bin/sh\necho "$@" >> '${logFile}'\ncase "$1" in\n  list) echo '[{"id":"th-9","title":"Fix","status":"running","needs":"nothing"}]' ;;\n  status) echo "" ;;\nesac\n`,
+    { mode: 0o755 },
+  );
+  const prevTb = process.env.BROWSERBEAR_TB;
+  process.env.BROWSERBEAR_TB = tb;
+  t.after(() => {
+    if (prevTb === undefined) delete process.env.BROWSERBEAR_TB;
+    else process.env.BROWSERBEAR_TB = prevTb;
+  });
+
+  const sent = [];
+  const marks = createMarks({ tickMs: 50, log: () => {}, send: async (_tabId, m) => sent.push(m) });
+  t.after(() => marks.close());
+
+  marks.begin(9, "th-9", "working");
+  await sleep(150);
+  await marks.stop(9);
+  const calls = fs.readFileSync(logFile, "utf8");
+  assert.match(calls, /interrupt th-9/, "Stop button interrupts the thread");
+
+  // Periodic ticks still work after stop(tabId) (i.e. stop() was not clobbered by cleanup).
+  marks.end(9);
+  marks.finished(9);
+  await sleep(100);
+  assert.ok(sent.some((m) => m?.thanks === true));
+});
+
+test("createMarks sends null before deleting a claim when the mark expires mid-send", async (t) => {
+  const prevTb = process.env.BROWSERBEAR_TB;
+  process.env.BROWSERBEAR_TB = "";
+  t.after(() => {
+    if (prevTb === undefined) delete process.env.BROWSERBEAR_TB;
+    else process.env.BROWSERBEAR_TB = prevTb;
+  });
+
+  // Override THANKS_MS via a fresh dynamic import? Instead, simulate via thanks expiring:
+  // THANKS_MS defaults to 3000ms unless BROWSERBEAR_THANKS_MS was set; here we test
+  // the exact race by letting a send take longer than a short-lived claim or using thanks.
+  // Actually test with a mark that becomes null during await send (thread archived/gone in tb list,
+  // or using finished() + send lasting > THANKS_MS is 3.1s — fast enough for a real test!).
+  const sent = [];
+  let slowOnce = true;
+  const marks = createMarks({
+    tickMs: 50,
+    log: () => {},
+    send: async (_tabId, m) => {
+      if (m?.thanks && slowOnce) {
+        slowOnce = false;
+        await sleep(3100); // thanks (3000ms) expires while this send is in flight
+      }
+      sent.push(m);
+    },
+  });
+  t.after(() => marks.close());
+
+  marks.begin(11, null, "working");
+  marks.end(11);
+  await sleep(80);
+  marks.finished(11);
+  await sleep(3400);
+
+  assert.equal(sent.at(-1), null, "final null clear must be sent even when thanks expired mid-send");
+});
+
+test("createMarks.release guarantees null lands after an older delayed send", async (t) => {
+  const prevTb = process.env.BROWSERBEAR_TB;
+  process.env.BROWSERBEAR_TB = "";
+  t.after(() => {
+    if (prevTb === undefined) delete process.env.BROWSERBEAR_TB;
+    else process.env.BROWSERBEAR_TB = prevTb;
+  });
+
+  const arrived = [];
+  let releaseFirst;
+  const firstDone = new Promise((r) => (releaseFirst = r));
+  let firstCall = true;
+  const marks = createMarks({
+    tickMs: 50,
+    log: () => {},
+    send: async (_tabId, m) => {
+      if (firstCall && m) {
+        firstCall = false;
+        await firstDone; // delayed in ownerOf() until after release() already sent its first null
+      }
+      arrived.push(m);
+    },
+  });
+  t.after(() => marks.close());
+
+  marks.begin(12, null, "working");
+  await sleep(20);
+  const rel = marks.release(12);
+  await sleep(30);
+  releaseFirst();
+  await rel;
+
+  assert.equal(arrived.at(-1), null, "final mark delivered after delayed send must be null");
 });

@@ -30,7 +30,7 @@ const shortName = (title) => {
 
 // send(tabId, mark | null) draws or clears a tab's marks; it rejects with
 // "No tab with id" once the tab is gone.
-export function createMarks({ send, log }) {
+export function createMarks({ send, log, tickMs = TICK_MS }) {
   const claims = new Map(); // tabId -> { thread, action, at, busy, yours, sent, waitSeen, doneClicked, thanks }
   const released = new Set(); // tabs you pressed ✕ on, which a wait mustn't mark again
   let threads = null; // id -> thread, from tb list; null until it first answers
@@ -85,26 +85,60 @@ export function createMarks({ send, log }) {
   async function push(tabId) {
     const c = claims.get(tabId);
     if (!c) return;
-    const mark = markFor(c);
-    const key = JSON.stringify(mark);
-    if (key !== c.sent) {
-      try {
-        await send(tabId, mark);
-        c.sent = key;
-      } catch (e) {
-        if (/no tab/i.test(e.message)) claims.delete(tabId);
-        else log('mark failed', tabId, e.message); // an older extension, or a page that won't take scripts
-        return;
-      }
+    // One in-flight mark RPC per tab; concurrent calls coalesce instead of
+    // piling up on a slow/stuck tab when send() takes longer than tickMs.
+    if (c.sending) {
+      c.dirty = true;
+      return c.sending;
     }
-    if (!mark && claims.get(tabId) === c && !c.busy) claims.delete(tabId);
+    let active = true;
+    const run = (async () => {
+      try {
+      do {
+        c.dirty = false;
+        const mark = markFor(c);
+        const key = JSON.stringify(mark);
+        if (key !== c.sent) {
+          if (c.retryAt && Date.now() < c.retryAt) return;
+          try {
+            await send(tabId, mark);
+            c.sent = key;
+            c.fails = 0;
+            c.retryAt = 0;
+          } catch (e) {
+            if (/no tab/i.test(e.message)) {
+              claims.delete(tabId);
+            } else {
+              c.fails = (c.fails || 0) + 1;
+              c.retryAt = Date.now() + Math.min(60_000, tickMs * 2 ** Math.min(c.fails - 1, 10));
+              log('mark failed', tabId, e.message); // an older extension, or a page that won't take scripts
+            }
+            return;
+          }
+        }
+      } while (claims.get(tabId) === c && (c.dirty || JSON.stringify(markFor(c)) !== c.sent));
+      if (c.sent === 'null' && claims.get(tabId) === c && !c.busy && !markFor(c)) claims.delete(tabId);
+      } finally {
+        active = false;
+        c.sending = null;
+      }
+    })();
+    if (active) c.sending = run;
+    return run;
   }
 
-  setInterval(async () => {
-    if (!claims.size) return;
-    await refreshThreads();
-    for (const tabId of [...claims.keys()]) await push(tabId);
-  }, TICK_MS).unref();
+  let ticking = false;
+  const tickTimer = setInterval(async () => {
+    if (ticking || !claims.size) return;
+    ticking = true;
+    try {
+      await refreshThreads();
+      await Promise.allSettled([...claims.keys()].map((tabId) => push(tabId)));
+    } finally {
+      ticking = false;
+    }
+  }, tickMs);
+  tickTimer.unref();
 
   function claim(tabId, thread) {
     let c = claims.get(tabId);
@@ -171,9 +205,14 @@ export function createMarks({ send, log }) {
     },
     // From the pill's buttons.
     async release(tabId) {
+      const prev = claims.get(tabId)?.sending;
       claims.delete(tabId);
       released.add(tabId);
       await send(tabId, null).catch(() => {});
+      if (prev) {
+        await prev.catch(() => {});
+        if (!claims.has(tabId)) await send(tabId, null).catch(() => {});
+      }
     },
     // Opens the thread in the Mac app, with `open` rather than from Chrome,
     // which would ask first. An app too old to know the link (or none at
@@ -196,7 +235,14 @@ export function createMarks({ send, log }) {
     },
     // A profile (re)connected: its extension may have lost what it drew.
     resend() {
-      for (const c of claims.values()) c.sent = undefined;
+      for (const c of claims.values()) {
+        c.sent = undefined;
+        c.fails = 0;
+        c.retryAt = 0;
+      }
+    },
+    close() {
+      clearInterval(tickTimer);
     },
     // For `browserbear tabs`, so an agent can see a tab is another thread's.
     label(tabId) {
